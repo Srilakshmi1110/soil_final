@@ -1,241 +1,310 @@
+import os
+import sys
 import json
+import time
 import sqlite3
 import threading
-import time
-from datetime import datetime
+import hashlib
+import secrets
 from pathlib import Path
+from datetime import datetime, timezone
+from urllib.request import urlopen
+from urllib.parse import urlencode
 
-import joblib
 import numpy as np
 import pandas as pd
-import requests
+import joblib
+import serial
 import rasterio
-from pyproj import Transformer
+from rasterio.warp import transform as warp_transform
+
 from flask import Flask, jsonify, request, send_from_directory, session
 from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
-import sys
-import os
-from pathlib import Path
 
-# =========================================================
-# PROJECT PATH SETUP
-# =========================================================
+# ============================================================
+# PROJECT PATHS AND CONFIGURATION
+# ============================================================
 
-# Absolute path of backend/
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parents[1]
+BACKEND_DIR = BASE_DIR / "backend"
+MODEL_DIR = BACKEND_DIR / "models"
+DATA_DIR = BACKEND_DIR / "data"
+FRONTEND_DIR = BASE_DIR / "frontend"
+DB_FILE = DATA_DIR / "predictions.db"
 
-# Absolute path of project root/
-ROOT_DIR = BASE_DIR.parent
-
-# Make project root importable
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-# Make backend importable too
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 import config
 
-try:
-    from advice_engine import crop_advice as advice_crop_advice
-except Exception:
-    advice_crop_advice = None
-
-try:
-    from advice_engine import get_crop_recommendations
-except Exception:
-    get_crop_recommendations = None
-
-try:
-    import shap
-except Exception:
-    shap = None
-
-try:
-    from lime.lime_tabular import LimeTabularExplainer
-except Exception:
-    LimeTabularExplainer = None
-
-
-# ============================================================
-# PATHS / APP
-# ============================================================
-
-BASE_DIR = Path(__file__).resolve().parent
-ROOT_DIR = BASE_DIR.parent
-DATA_DIR = BASE_DIR / "data"
-MODELS_DIR = BASE_DIR / "models"
-
-# Keep the existing database location so old project data is not
-# silently moved to another database.
-DB_FILE = DATA_DIR / "predictions.db"
+SERIAL_PORT = getattr(config, "SERIAL_PORT", "COM10")
+SERIAL_BAUD = int(getattr(config, "SERIAL_BAUD", 9600))
 
 app = Flask(
     __name__,
-    static_folder=str(ROOT_DIR / "frontend"),
+    static_folder=str(FRONTEND_DIR),
     static_url_path=""
 )
 
 app.secret_key = getattr(
     config,
-    "SECRET_KEY",
-    "change-this-local-secret"
+    "SECRET_KEY", 
+    "soilai-local-development-secret"
 )
 
-CORS(
-    app,
-    supports_credentials=True
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax"
 )
 
+CORS(app, supports_credentials=True)
 
 # ============================================================
-# 7-FEATURE TEMPERATURE MODEL
+# THREAD LOCKS AND RUNTIME STATE
 # ============================================================
 
-FEATURES = [
-    "latitude",
-    "longitude",
-    "ph",
-    "moisture",
-    "temperature",
-    "nitrogen",
-    "cec",
-]
+DB_LOCK = threading.RLock()
+STATE_LOCK = threading.RLock()
 
-LGB_PATH = MODELS_DIR / "lgb_model_temperature.joblib"
-CAT_PATH = MODELS_DIR / "cat_model_temperature.joblib"
-FEATURE_PATH = MODELS_DIR / "feature_names_temperature.joblib"
-BACKGROUND_PATH = MODELS_DIR / "background_data_temperature.joblib"
-CLASSES_PATH = MODELS_DIR / "class_names_temperature.joblib"
+arduino = None
+arduino_lock = threading.Lock()
 
-print("=" * 70)
-print("EXPLAINABLE IoT FRAMEWORK FOR SOIL FERTILITY PREDICTION")
-print("=" * 70)
-print("Loading temperature-augmented models...")
-
-lgb_model = joblib.load(LGB_PATH)
-cat_model = joblib.load(CAT_PATH)
-feature_names = list(joblib.load(FEATURE_PATH))
-background_data = joblib.load(BACKGROUND_PATH)
-class_names = list(joblib.load(CLASSES_PATH))
-
-if feature_names != FEATURES:
-    raise RuntimeError(
-        f"Model features are {feature_names}; expected {FEATURES}"
-    )
-
-print("Models loaded:", feature_names)
-
+current = {
+    "connected": False,
+    "reading": None,
+    "prediction": None,
+    "explanation": None,
+    "timestamp": None,
+    "location_source": None,
+    "error": "Waiting for Arduino data."
+}
 
 # ============================================================
-# EXPLAINABILITY
+# MODEL LOADING
 # ============================================================
+
+lgb_model = None
+cat_model = None
+background_data = None
+class_names = []
+FEATURES = []
 
 shap_explainer = None
 lime_explainer = None
 
-if shap is not None:
-    try:
-        shap_explainer = shap.TreeExplainer(lgb_model)
-    except Exception as exc:
-        print("SHAP initialization warning:", exc)
+model_error = None
 
-if LimeTabularExplainer is not None:
+
+def load_first_existing(directory, filenames):
+    for filename in filenames:
+        path = directory / filename
+        if path.exists():
+            return joblib.load(path), path
+    raise FileNotFoundError(
+        "Could not find any of these model files: "
+        + ", ".join(filenames)
+    )
+
+
+def load_models():
+    global lgb_model
+    global cat_model
+    global background_data
+    global class_names
+    global FEATURES
+    global shap_explainer
+    global lime_explainer
+    global model_error
+
     try:
+        feature_data, feature_path = load_first_existing(
+            MODEL_DIR,
+            [
+                "feature_names_temperature.joblib",
+                "feature_names.joblib"
+            ]
+        )
+
+        FEATURES = list(feature_data)
+
+        if not FEATURES:
+            raise ValueError("The feature metadata file is empty.")
+
+        if len(FEATURES) not in (6, 7):
+            raise ValueError(
+                f"Unsupported model feature count: {len(FEATURES)}"
+            )
+
+        if len(FEATURES) == 7:
+            lgb_names = [
+                "lgb_model_temperature.joblib",
+                "lgb_model.joblib"
+            ]
+            cat_names = [
+                "cat_model_temperature.joblib",
+                "cat_model.joblib"
+            ]
+            background_names = [
+                "background_data_temperature.joblib",
+                "background_data.joblib"
+            ]
+            class_names_files = [
+                "class_names_temperature.joblib",
+                "class_names.joblib"
+            ]
+        else:
+            lgb_names = ["lgb_model.joblib"]
+            cat_names = ["cat_model.joblib"]
+            background_names = ["background_data.joblib"]
+            class_names_files = ["class_names.joblib"]
+
+        lgb_model, _ = load_first_existing(MODEL_DIR, lgb_names)
+        cat_model, _ = load_first_existing(MODEL_DIR, cat_names)
+
+        background_data, _ = load_first_existing(
+            MODEL_DIR,
+            background_names
+        )
+
+        try:
+            class_names, _ = load_first_existing(
+                MODEL_DIR,
+                class_names_files
+            )
+            class_names = list(class_names)
+        except FileNotFoundError:
+            class_names = []
+
+        if hasattr(lgb_model, "feature_names_in_"):
+            actual = list(lgb_model.feature_names_in_)
+            if actual != FEATURES:
+                raise ValueError(
+                    f"LightGBM feature mismatch. "
+                    f"Metadata: {FEATURES}; model: {actual}"
+                )
+
+        if hasattr(cat_model, "feature_names_"):
+            actual = list(cat_model.feature_names_)
+            if actual and actual != FEATURES:
+                raise ValueError(
+                    f"CatBoost feature mismatch. "
+                    f"Metadata: {FEATURES}; model: {actual}"
+                )
+
+        if hasattr(lgb_model, "n_features_in_"):
+            if lgb_model.n_features_in_ != len(FEATURES):
+                raise ValueError(
+                    "LightGBM feature count does not match metadata."
+                )
+
+        # Validate CatBoost using its actual feature names.
+        cat_feature_names = getattr(cat_model, "feature_names_", None)
+
+        if cat_feature_names:
+            if list(cat_feature_names) != FEATURES:
+                raise ValueError(
+                f"CatBoost feature mismatch. "
+                f"Expected: {FEATURES}, "
+                f"Found: {list(cat_feature_names)}"
+                )
+        else:
+            cat_feature_count = getattr(cat_model, "n_features_in_", None)
+
+            if cat_feature_count not in (None, 0, len(FEATURES)):
+                raise ValueError(
+                f"CatBoost expects {cat_feature_count} features, "
+                f"but metadata contains {len(FEATURES)}."
+                )
+
+        print("Models loaded successfully.")
+        print("Feature metadata:", feature_path.name)
+        print("Features:", FEATURES)
+
+        initialize_explainers()
+
+        model_error = None
+        return True
+
+    except Exception as exc:
+        model_error = str(exc)
+        print("MODEL LOADING ERROR:", model_error)
+        return False
+
+
+def initialize_explainers():
+    global shap_explainer
+    global lime_explainer
+
+    try:
+        import shap
+
+        shap_explainer = shap.TreeExplainer(lgb_model)
+
+    except Exception as exc:
+        shap_explainer = None
+        print("SHAP unavailable:", exc)
+
+    try:
+        from lime.lime_tabular import LimeTabularExplainer
+
         lime_explainer = LimeTabularExplainer(
             np.asarray(background_data),
             feature_names=FEATURES,
-            class_names=[str(x) for x in class_names],
+            class_names=class_names or None,
             mode="classification",
             discretize_continuous=True,
-            random_state=42,
+            random_state=42
         )
+
     except Exception as exc:
-        print("LIME initialization warning:", exc)
+        lime_explainer = None
+        print("LIME unavailable:", exc)
 
 
-# ============================================================
-# RASTERS
-# ============================================================
-
-RASTER_FILES = {
-    "ph": DATA_DIR / "ph.tif",
-    "nitrogen": DATA_DIR / "nitrogen.tif",
-    "cec": DATA_DIR / "cec.tif",
-}
-
-RASTER_CRS = "ESRI:54052"
-
-raster_transformer = Transformer.from_crs(
-    "EPSG:4326",
-    RASTER_CRS,
-    always_xy=True
-)
-
+load_models()
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-DB_LOCK = threading.Lock()
-
-
 def db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
     conn = sqlite3.connect(
-        DB_FILE,
-        timeout=30
+        str(DB_FILE),
+        timeout=20,
+        check_same_thread=False
     )
+
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+
     return conn
 
 
-def add_column_if_missing(cur, table, column, definition):
-    columns = {
-        row[1]
-        for row in cur.execute(
-            f"PRAGMA table_info({table})"
-        ).fetchall()
-    }
-
-    if column not in columns:
-        cur.execute(
-            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        )
-
-
 def init_database():
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     with DB_LOCK:
         conn = db()
-        cur = conn.cursor()
 
-        cur.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
-            """
-        )
+        """)
 
-        cur.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
                 user_id INTEGER,
                 latitude REAL NOT NULL,
                 longitude REAL NOT NULL,
-                input_mode TEXT DEFAULT 'iot',
                 ph REAL NOT NULL,
                 moisture REAL NOT NULL,
                 temperature REAL,
@@ -249,167 +318,86 @@ def init_database():
                 cat_confidence REAL NOT NULL,
                 model_agreement INTEGER NOT NULL,
                 shap_data TEXT,
-                lime_data TEXT,
-                crop_recommendation TEXT,
-                FOREIGN KEY(user_id) REFERENCES users(id)
+                lime_data TEXT
             )
-            """
-        )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sensor_readings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                timestamp TEXT NOT NULL,
-                moisture REAL,
-                temperature REAL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-            """
-        )
-
-        cur.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS app_state (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
-            """
-        )
-
-        # Upgrade an older predictions table without destroying it.
-        add_column_if_missing(
-            cur, "predictions", "input_mode",
-            "TEXT DEFAULT 'iot'"
-        )
-        add_column_if_missing(
-            cur, "predictions", "temperature",
-            "REAL"
-        )
-        add_column_if_missing(
-            cur, "predictions", "crop_recommendation",
-            "TEXT"
-        )
-
-        add_column_if_missing(
-            cur, "users", "username",
-            "TEXT"
-        )
-        add_column_if_missing(
-            cur, "users", "mobile",
-            "TEXT"
-        )
-        add_column_if_missing(
-            cur, "sensor_readings", "ph",
-            "REAL"
-        )
-
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username) WHERE username IS NOT NULL AND username != ''"
-        )
+        """)
 
         conn.commit()
         conn.close()
 
-    print("Database initialized:", DB_FILE)
+    print("Database initialized.")
 
 
 init_database()
 
 
 # ============================================================
-# HELPERS
+# PASSWORD HANDLING
 # ============================================================
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        200000
+    )
+
+    return salt.hex() + ":" + digest.hex()
+
+
+def verify_password(password, stored):
+    try:
+        salt_hex, digest_hex = stored.split(":")
+
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt_hex),
+            200000
+        )
+
+        return secrets.compare_digest(
+            candidate.hex(),
+            digest_hex
+        )
+
+    except Exception:
+        return False
+
 
 def utc_now():
-    return datetime.utcnow().isoformat() + "Z"
-
-
-def current_user():
-    user_id = session.get("user_id")
-
-    if not user_id:
-        return None
-
-    with DB_LOCK:
-        conn = db()
-        row = conn.execute(
-            "SELECT id, name, username, email, mobile FROM users WHERE id = ?",
-            (user_id,)
-        ).fetchone()
-        conn.close()
-
-    return row
-
-
-def login_required():
-    user = current_user()
-
-    if user is None:
-        return None, (
-            jsonify({
-                "success": False,
-                "error": "Login required"
-            }),
-            401
-        )
-
-    return user, None
-
-
-def number(data, key, minimum=None, maximum=None):
-    value = data.get(key)
-
-    if value is None or value == "":
-        raise ValueError(f"{key} is required")
-
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{key} must be numeric")
-
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{key} is below the allowed range")
-
-    if maximum is not None and value > maximum:
-        raise ValueError(f"{key} is above the allowed range")
-
-    return value
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
-# LOCATION / RASTER
+# LOCATION AND RASTER DATA
 # ============================================================
 
-def save_location(latitude, longitude, source="browser"):
-    payload = {
-        "latitude": float(latitude),
-        "longitude": float(longitude),
-        "source": source
-    }
-
-    with DB_LOCK:
-        conn = db()
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO app_state(key, value)
-            VALUES ('location', ?)
-            """,
-            (json.dumps(payload),)
-        )
-        conn.commit()
-        conn.close()
-
-    return payload
+RASTER_FILES = {
+    "nitrogen": DATA_DIR / "nitrogen.tif",
+    "cec": DATA_DIR / "cec.tif"
+}
 
 
 def get_location():
     with DB_LOCK:
         conn = db()
+
         row = conn.execute(
-            "SELECT value FROM app_state WHERE key = 'location'"
+            "SELECT value FROM app_state WHERE key = ?",
+            ("location",)
         ).fetchone()
+
         conn.close()
 
     if not row:
@@ -419,31 +407,29 @@ def get_location():
         return json.loads(row["value"])
     except Exception:
         return None
-    RASTER_CRS = "ESRI:54052"
-
-raster_transformer = Transformer.from_crs(
-    "EPSG:4326",
-    RASTER_CRS,
-    always_xy=True
-)
 
 
 def raster_value(path, latitude, longitude):
-    path = Path(path)
-
     if not path.exists():
         raise FileNotFoundError(
-            f"Missing raster: {path.name}"
+            f"Required raster file is missing: {path.name}"
         )
-
-    x, y = raster_transformer.transform(
-        float(longitude),
-        float(latitude)
-    )
 
     with rasterio.open(path) as src:
 
-        row, col = src.index(x, y)
+        if src.crs is None:
+            raise ValueError(
+                f"{path.name} does not contain a coordinate reference system."
+            )
+
+        xs, ys = warp_transform(
+            "EPSG:4326",
+            src.crs,
+            [longitude],
+            [latitude]
+        )
+
+        row, col = src.index(xs[0], ys[0])
 
         if (
             row < 0
@@ -452,93 +438,79 @@ def raster_value(path, latitude, longitude):
             or col >= src.width
         ):
             raise ValueError(
-                f"Location is outside {path.name}"
+                f"The selected location is outside {path.name}."
             )
 
-        nodata = src.nodata
-
-        # Read only the required pixel
-        pixel = src.read(
+        value = src.read(
             1,
-            window=rasterio.windows.Window(
-                col,
-                row,
-                1,
-                1
-            )
-        )
+            window=((row, row + 1), (col, col + 1))
+        )[0, 0]
 
-        value = float(pixel[0, 0])
-
-        if (
-            np.isfinite(value)
-            and (
-                nodata is None
-                or not np.isclose(value, nodata)
-            )
-        ):
-            return value
-
-        # Search nearby pixels when exact pixel is NoData
-        for radius in [1, 2, 4, 8, 16]:
-
-            r0 = max(0, row - radius)
-            c0 = max(0, col - radius)
-
-            r1 = min(
-                src.height,
-                row + radius + 1
-            )
-
-            c1 = min(
-                src.width,
-                col + radius + 1
-            )
-
-            window = rasterio.windows.Window(
-                c0,
-                r0,
-                c1 - c0,
-                r1 - r0
-            )
-
-            values = src.read(
-                1,
-                window=window
-            ).astype(float)
-
-            values = values[
-                np.isfinite(values)
-            ]
-
-            if nodata is not None:
-                values = values[
-                    ~np.isclose(
-                        values,
-                        nodata
-                    )
-                ]
-
-            if values.size:
-                return float(
-                    np.median(values)
+        if src.nodata is not None:
+            if np.isclose(value, src.nodata):
+                raise ValueError(
+                    f"No raster data is available in {path.name} "
+                    "for this location."
                 )
 
-    raise ValueError(
-        f"No valid value found in {path.name} "
-        f"at {latitude}, {longitude}"
-    )
+        if not np.isfinite(value):
+            raise ValueError(
+                f"Invalid raster value in {path.name}."
+            )
 
-    return value
+        return float(value)
+
+
+def enrich_sensor_reading(ph, moisture, temperature, latitude, longitude):
+    values = {
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "ph": float(ph),
+        "moisture": float(moisture),
+        "nitrogen": raster_value(
+            RASTER_FILES["nitrogen"],
+            latitude,
+            longitude
+        ),
+        "cec": raster_value(
+            RASTER_FILES["cec"],
+            latitude,
+            longitude
+        )
+    }
+
+    if "temperature" in FEATURES:
+        if temperature is None:
+            raise ValueError(
+                "The trained model requires temperature, "
+                "but the Arduino did not provide it."
+            )
+
+        values["temperature"] = float(temperature)
+
+    missing = [name for name in FEATURES if name not in values]
+
+    if missing:
+        raise ValueError(
+            "Required model inputs are unavailable: "
+            + ", ".join(missing)
+        )
+
+    return values
 
 
 # ============================================================
-# MODEL / EXPLAINABILITY
+# MACHINE LEARNING PREDICTION
 # ============================================================
 
 def predict_soil(values):
+    if lgb_model is None or cat_model is None:
+        raise RuntimeError(
+            model_error or "The trained models are not available."
+        )
+
     X = pd.DataFrame(
-        [[values[f] for f in FEATURES]],
+        [[values[name] for name in FEATURES]],
         columns=FEATURES
     )
 
@@ -550,53 +522,43 @@ def predict_soil(values):
         cat_model.predict_proba(X)
     )[0]
 
-    lgb_idx = int(np.argmax(lgb_probs))
-    cat_idx = int(np.argmax(cat_probs))
+    lgb_index = int(np.argmax(lgb_probs))
+    cat_index = int(np.argmax(cat_probs))
 
-    lgb_classes = list(
-        getattr(lgb_model, "classes_", class_names)
-    )
+    if hasattr(lgb_model, "classes_"):
+        lgb_prediction = str(
+            lgb_model.classes_[lgb_index]
+        )
+    else:
+        lgb_prediction = str(
+            lgb_model.predict(X)[0]
+        )
 
-    cat_classes = list(
-        getattr(cat_model, "classes_", class_names)
-    )
+    if hasattr(cat_model, "classes_"):
+        cat_prediction = str(
+            cat_model.classes_[cat_index]
+        )
+    elif class_names and cat_index < len(class_names):
+        cat_prediction = str(class_names[cat_index])
+    else:
+        cat_prediction = str(cat_model.predict(X)[0])
 
-    lgb_prediction = str(
-        lgb_classes[lgb_idx]
-    )
+    lgb_confidence = float(lgb_probs[lgb_index])
+    cat_confidence = float(cat_probs[cat_index])
 
-    cat_prediction = str(
-        cat_classes[cat_idx]
-    )
-
-    lgb_confidence = float(
-        lgb_probs[lgb_idx]
-    )
-
-    cat_confidence = float(
-        cat_probs[cat_idx]
-    )
-
-    agreement = (
-        lgb_prediction == cat_prediction
-    )
+    agreement = lgb_prediction == cat_prediction
 
     if agreement:
         fertility = lgb_prediction
         confidence = (
-            lgb_confidence +
-            cat_confidence
+            lgb_confidence + cat_confidence
         ) / 2
+    elif lgb_confidence >= cat_confidence:
+        fertility = lgb_prediction
+        confidence = lgb_confidence
     else:
-        fertility = (
-            lgb_prediction
-            if lgb_confidence >= cat_confidence
-            else cat_prediction
-        )
-        confidence = min(
-            lgb_confidence,
-            cat_confidence
-        )
+        fertility = cat_prediction
+        confidence = cat_confidence
 
     result = {
         **values,
@@ -607,51 +569,53 @@ def predict_soil(values):
         "lgb_confidence": lgb_confidence,
         "cat_confidence": cat_confidence,
         "model_agreement": agreement,
-        "timestamp": utc_now(),
+        "timestamp": utc_now()
     }
 
     return result, X
 
 
-def explain(X, result):
+# ============================================================
+# SHAP AND LIME EXPLANATIONS
+# ============================================================
+
+def explain_prediction(X, result):
     shap_items = []
     lime_items = []
 
     if shap_explainer is not None:
         try:
-            sv = shap_explainer(X)
-            vals = np.asarray(sv.values)
+            explanation = shap_explainer(X)
+            values = np.asarray(explanation.values)
 
-            if vals.ndim == 3:
-                class_index = list(
-                    lgb_model.classes_
-                ).index(
-                    result["lgb_prediction"]
-                )
-                vals = vals[0, :, class_index]
+            if values.ndim == 3:
+                class_index = 0
+
+                if hasattr(lgb_model, "classes_"):
+                    classes = list(lgb_model.classes_)
+
+                    if result["lgb_prediction"] in classes:
+                        class_index = classes.index(
+                            result["lgb_prediction"]
+                        )
+
+                values = values[0, :, class_index]
+
             else:
-                vals = vals[0]
+                values = values[0]
 
-            for feature, value in zip(
-                FEATURES,
-                vals
-            ):
+            for feature, value in zip(FEATURES, values):
                 shap_items.append({
                     "feature": feature,
                     "value": float(value)
                 })
 
-            shap_items.sort(
-                key=lambda x: abs(x["value"]),
-                reverse=True
-            )
-
         except Exception as exc:
-            print("SHAP warning:", exc)
+            print("SHAP explanation error:", exc)
 
     if lime_explainer is not None:
         try:
-            exp = lime_explainer.explain_instance(
+            explanation = lime_explainer.explain_instance(
                 X.iloc[0].values,
                 lambda array: lgb_model.predict_proba(
                     pd.DataFrame(
@@ -662,14 +626,14 @@ def explain(X, result):
                 num_features=len(FEATURES)
             )
 
-            for feature, weight in exp.as_list():
+            for feature, weight in explanation.as_list():
                 lime_items.append({
                     "feature": feature,
                     "weight": float(weight)
                 })
 
         except Exception as exc:
-            print("LIME warning:", exc)
+            print("LIME explanation error:", exc)
 
     return {
         "shap": shap_items,
@@ -678,118 +642,21 @@ def explain(X, result):
 
 
 # ============================================================
-# CROP RECOMMENDATION
+# SAVE PREDICTIONS
 # ============================================================
 
-def crop_advice(values, fertility):
-    """Return a consistent crop recommendation object for the frontend."""
+def save_prediction(result, explanation):
+    user_id = session.get("user_id")
 
-    # Prefer the project's advice_engine implementation when available.
-    if advice_crop_advice is not None:
-        try:
-            result = advice_crop_advice(values, fertility)
-            if isinstance(result, dict):
-                return result
-            if isinstance(result, list):
-                return {
-                    "fertility": str(fertility),
-                    "summary": "Crop suitability is generated from the current soil and environmental conditions.",
-                    "inputs": {k: values[k] for k in ("ph", "moisture", "temperature", "nitrogen", "cec")},
-                    "recommendations": result,
-                }
-        except Exception as exc:
-            print("Crop recommendation warning:", exc)
-
-    if get_crop_recommendations is not None:
-        try:
-            result = get_crop_recommendations(
-                ph=values["ph"],
-                moisture=values["moisture"],
-                nitrogen=values["nitrogen"],
-                cec=values["cec"],
-                temperature=values["temperature"],
-                fertility=fertility
-            )
-            if isinstance(result, dict):
-                return result
-            if isinstance(result, list):
-                return {
-                    "fertility": str(fertility),
-                    "summary": "Crop suitability is generated from the current soil and environmental conditions.",
-                    "inputs": {k: values[k] for k in ("ph", "moisture", "temperature", "nitrogen", "cec")},
-                    "recommendations": result,
-                }
-        except Exception as exc:
-            print("Crop recommendation warning:", exc)
-
-    rules = {
-        "Rice": ((5.5, 7.5), (60, 90), (20, 35), "Rice generally suits warm conditions with relatively high soil moisture."),
-        "Wheat": ((6.0, 7.5), (40, 70), (15, 25), "Wheat generally suits moderate moisture and cooler growing temperatures."),
-        "Maize": ((5.8, 7.2), (45, 75), (18, 32), "Maize generally suits moderately moist soil and warm temperatures."),
-        "Groundnut": ((5.5, 7.0), (35, 65), (20, 30), "Groundnut generally suits moderately moist soil and warm conditions."),
-        "Millet": ((5.5, 7.5), (30, 60), (20, 35), "Millet can tolerate comparatively lower moisture conditions and warm temperatures."),
-    }
-
-    recommendations = []
-    for crop, (ph_range, moisture_range, temp_range, reason) in rules.items():
-        checks = {
-            "pH": ph_range[0] <= values["ph"] <= ph_range[1],
-            "Moisture": moisture_range[0] <= values["moisture"] <= moisture_range[1],
-            "Temperature": temp_range[0] <= values["temperature"] <= temp_range[1],
-        }
-        matched = sum(checks.values())
-        suitability = (
-            "Suitable" if matched == 3 else
-            "Moderately Suitable" if matched == 2 else
-            "Less Suitable"
-        )
-        passed = [k for k, v in checks.items() if v]
-        failed = [k for k, v in checks.items() if not v]
-        explanation = reason
-        if passed:
-            explanation += " " + ", ".join(passed) + " conditions match the defined range."
-        if failed:
-            explanation += " " + ", ".join(failed) + " conditions are outside the defined range."
-        explanation += (
-            f" The ML fertility prediction is {fertility}. "
-            f"Nitrogen={values['nitrogen']:.2f} and CEC={values['cec']:.2f} are also included in the soil assessment."
-        )
-        recommendations.append({
-            "crop": crop,
-            "suitability": suitability,
-            "reason": explanation,
-            "matched_conditions": matched,
-            "total_conditions": 3,
-            "conditions": checks,
-        })
-
-    priority = {"Suitable": 0, "Moderately Suitable": 1, "Less Suitable": 2}
-    recommendations.sort(key=lambda item: (priority[item["suitability"]], -item["matched_conditions"]))
-
-    return {
-        "fertility": str(fertility),
-        "summary": "Crop suitability is generated by a rule-based decision-support engine using the ML fertility prediction and soil/environment conditions.",
-        "inputs": {k: values[k] for k in ("ph", "moisture", "temperature", "nitrogen", "cec")},
-        "recommendations": recommendations,
-    }
-
-
-# ============================================================
-# SAVE PREDICTION
-# ============================================================
-
-def save_prediction(result, explanation, crops, user_id):
     with DB_LOCK:
         conn = db()
 
-        conn.execute(
-            """
+        conn.execute("""
             INSERT INTO predictions (
                 timestamp,
                 user_id,
                 latitude,
                 longitude,
-                input_mode,
                 ph,
                 moisture,
                 temperature,
@@ -803,863 +670,746 @@ def save_prediction(result, explanation, crops, user_id):
                 cat_confidence,
                 model_agreement,
                 shap_data,
-                lime_data,
-                crop_recommendation
+                lime_data
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                result["timestamp"],
-                user_id,
-                result["latitude"],
-                result["longitude"],
-                result.get("input_mode", "manual"),
-                result["ph"],
-                result["moisture"],
-                result["temperature"],
-                result["nitrogen"],
-                result["cec"],
-                result["fertility"],
-                result["confidence"],
-                result["lgb_prediction"],
-                result["cat_prediction"],
-                result["lgb_confidence"],
-                result["cat_confidence"],
-                int(result["model_agreement"]),
-                json.dumps(
-                    explanation.get("shap", [])
-                ),
-                json.dumps(
-                    explanation.get("lime", [])
-                ),
-                json.dumps(crops)
-            )
-        )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            result["timestamp"],
+            user_id,
+            result["latitude"],
+            result["longitude"],
+            result["ph"],
+            result["moisture"],
+            result.get("temperature"),
+            result["nitrogen"],
+            result["cec"],
+            result["fertility"],
+            result["confidence"],
+            result["lgb_prediction"],
+            result["cat_prediction"],
+            result["lgb_confidence"],
+            result["cat_confidence"],
+            int(result["model_agreement"]),
+            json.dumps(explanation.get("shap", [])),
+            json.dumps(explanation.get("lime", []))
+        ))
 
         conn.commit()
-        prediction_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.close()
 
-    return prediction_id
+
+# ============================================================
+# ARDUINO CONNECTION
+# ============================================================
+
+def connect_arduino():
+    global arduino
+
+    with arduino_lock:
+        try:
+            if arduino is not None and arduino.is_open:
+                return True
+
+            arduino = serial.Serial(
+                SERIAL_PORT,
+                SERIAL_BAUD,
+                timeout=1
+            )
+
+            time.sleep(2)
+
+            print(
+                f"Arduino connected on {SERIAL_PORT} "
+                f"at {SERIAL_BAUD} baud."
+            )
+
+            return True
+
+        except Exception as exc:
+            arduino = None
+            print("Arduino connection error:", exc)
+            return False
+
+
+def read_arduino():
+    global arduino
+
+    if arduino is None:
+        connect_arduino()
+        return None
+
+    try:
+        line = arduino.readline().decode(
+            "utf-8",
+            errors="ignore"
+        ).strip()
+
+        if not line:
+            return None
+
+        # Accept comma-separated numeric readings:
+        # pH,moisture
+        # pH,moisture,temperature
+
+        parts = line.split(",")
+
+        if len(parts) not in (2, 3):
+            return None
+
+        values = [float(part.strip()) for part in parts]
+
+        ph = values[0]
+        moisture = values[1]
+        temperature = values[2] if len(values) == 3 else None
+
+        if not 0 <= ph <= 14:
+            return None
+
+        if not 0 <= moisture <= 100:
+            return None
+
+        if temperature is not None:
+            if not -20 <= temperature <= 100:
+                return None
+
+        return ph, moisture, temperature
+
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+    except Exception as exc:
+        print("Arduino read error:", exc)
+
+        try:
+            arduino.close()
+        except Exception:
+            pass
+
+        arduino = None
+        return None
 
 
 # ============================================================
-# AUTHENTICATION
+# SENSOR BACKGROUND THREAD
 # ============================================================
 
-@app.route("/api/signup", methods=["POST"])
+def sensor_loop():
+    global current
+
+    while True:
+        reading = read_arduino()
+
+        if reading is None:
+            with STATE_LOCK:
+                current["connected"] = arduino is not None
+
+                if arduino is None:
+                    current["error"] = (
+                        "Arduino disconnected. "
+                        "No simulated sensor values are used."
+                    )
+
+            time.sleep(2)
+            continue
+
+        ph, moisture, temperature = reading
+
+        with STATE_LOCK:
+            current["connected"] = True
+            current["reading"] = {
+                "ph": ph,
+                "moisture": moisture,
+                "temperature": temperature
+            }
+
+        location_data = get_location()
+
+        if not location_data:
+            with STATE_LOCK:
+                current["error"] = (
+                    "Arduino is connected. "
+                    "Set your field location to obtain "
+                    "nitrogen and CEC raster values."
+                )
+
+            time.sleep(2)
+            continue
+
+        try:
+            values = enrich_sensor_reading(
+                ph,
+                moisture,
+                temperature,
+                location_data["latitude"],
+                location_data["longitude"]
+            )
+
+            result, X = predict_soil(values)
+
+            explanation = explain_prediction(
+                X,
+                result
+            )
+
+            with STATE_LOCK:
+                current = {
+                    "connected": True,
+                    "reading": values,
+                    "prediction": result,
+                    "explanation": explanation,
+                    "timestamp": result["timestamp"],
+                    "location_source": location_data.get(
+                        "source",
+                        "browser"
+                    ),
+                    "error": None
+                }
+
+        except Exception as exc:
+            with STATE_LOCK:
+                current["connected"] = True
+                current["error"] = str(exc)
+
+        time.sleep(2)
+
+
+# ============================================================
+# AUTHENTICATION API
+# ============================================================
+
 @app.route("/api/auth/signup", methods=["POST"])
+@app.route("/api/signup", methods=["POST"])
 def signup():
     data = request.get_json(silent=True) or {}
 
-    name = str(data.get("farmer_name", data.get("name", ""))).strip()
-    username = str(data.get("username", "")).strip()
-    email = str(data.get("email", data.get("contact", ""))).strip().lower()
-    mobile = str(data.get("mobile", "")).strip()
+    name = str(data.get("name", "")).strip()
+    email = str(data.get("email", "")).strip().lower()
     password = str(data.get("password", ""))
 
     if not name or not email or len(password) < 6:
         return jsonify({
             "success": False,
-            "error": "Name, email and a password of at least 6 characters are required."
+            "error": (
+                "Name, email and a password of at least "
+                "6 characters are required."
+            )
+        }), 400
+
+    try:
+        with DB_LOCK:
+            conn = db()
+
+            cursor = conn.execute("""
+                INSERT INTO users (
+                    name,
+                    email,
+                    password_hash
+                )
+                VALUES (?, ?, ?)
+            """, (
+                name,
+                email,
+                hash_password(password)
+            ))
+
+            conn.commit()
+            user_id = cursor.lastrowid
+            conn.close()
+
+        session["user_id"] = user_id
+        session["user_name"] = name
+
+        return jsonify({
+            "success": True,
+            "user": {
+                "id": user_id,
+                "name": name,
+                "email": email
+            }
+        })
+
+    except sqlite3.IntegrityError:
+        return jsonify({
+            "success": False,
+            "error": "An account with that email already exists."
+        }), 409
+
+
+@app.route("/api/auth/login", methods=["POST"])
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True) or {}
+
+    email = str(
+        data.get("email")
+        or data.get("username")
+        or data.get("identifier")
+        or ""
+    ).strip().lower()
+
+    password = str(data.get("password", ""))
+
+    if not email or not password:
+        return jsonify({
+            "success": False,
+            "error": "Enter your email and password."
         }), 400
 
     with DB_LOCK:
         conn = db()
-        try:
-            if username:
-                existing = conn.execute(
-                    "SELECT id FROM users WHERE lower(email)=lower(?) OR username=?",
-                    (email, username)
-                ).fetchone()
-            else:
-                existing = conn.execute(
-                    "SELECT id FROM users WHERE lower(email)=lower(?)",
-                    (email,)
-                ).fetchone()
 
-            if existing is not None:
-                return jsonify({
-                    "success": False,
-                    "error": "An account with this email or username already exists."
-                }), 409
-
-            cur = conn.execute(
-                """
-                INSERT INTO users (name, username, email, mobile, password_hash)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (name, username or None, email, mobile or None, generate_password_hash(password))
-            )
-            user_id = cur.lastrowid
-            conn.commit()
-        except sqlite3.IntegrityError as exc:
-            conn.rollback()
-            return jsonify({
-                "success": False,
-                "error": f"Could not create account: {exc}"
-            }), 409
-        finally:
-            conn.close()
-
-    session["user_id"] = user_id
-    session["user_name"] = name
-    session["username"] = username
-    session["mobile"] = mobile
-
-    return jsonify({
-        "success": True,
-        "message": "Farmer account created.",
-        "user": {
-            "id": user_id,
-            "name": name,
-            "farmer_name": name,
-            "username": username,
-            "email": email,
-            "mobile": mobile
-        }
-    })
-
-
-@app.route("/api/login", methods=["POST"])
-@app.route("/api/auth/login", methods=["POST"])
-def login():
-    data = request.get_json(silent=True) or {}
-    login_value = str(
-        data.get("username") or data.get("email") or data.get("mobile") or data.get("contact") or ""
-    ).strip()
-    password = str(data.get("password", ""))
-
-    if not login_value or not password:
-        return jsonify({"success": False, "error": "Username/email/mobile and password are required."}), 400
-
-    with DB_LOCK:
-        conn = db()
         row = conn.execute(
-            """
-            SELECT id, name, username, email, mobile, password_hash
-            FROM users
-            WHERE lower(email)=lower(?) OR lower(username)=lower(?) OR mobile=?
-            LIMIT 1
-            """,
-            (login_value, login_value, login_value)
+            "SELECT * FROM users WHERE lower(email) = ?",
+            (email,)
         ).fetchone()
+
         conn.close()
 
-    if row is None or not check_password_hash(row["password_hash"], password):
+    if not row or not verify_password(
+        password,
+        row["password_hash"]
+    ):
         return jsonify({
             "success": False,
-            "error": "Invalid username/email/mobile or password."
+            "error": "Invalid email or password."
         }), 401
 
     session["user_id"] = row["id"]
     session["user_name"] = row["name"]
-    session["username"] = row["username"] or ""
-    session["mobile"] = row["mobile"] or ""
-
-    user_payload = {
-        "id": row["id"],
-        "name": row["name"],
-        "farmer_name": row["name"],
-        "username": row["username"] or "",
-        "email": row["email"],
-        "mobile": row["mobile"] or ""
-    }
 
     return jsonify({
         "success": True,
-        "message": "Login successful.",
-        "user": user_payload,
-        "farmer": user_payload
+        "logged_in": True,
+        "user": {
+            "id": row["id"],
+            "name": row["name"],
+            "email": row["email"]
+        }
     })
 
 
-@app.route("/api/logout", methods=["POST"])
 @app.route("/api/auth/logout", methods=["POST"])
+@app.route("/api/logout", methods=["POST"])
 def logout():
     session.clear()
 
     return jsonify({
-        "success": True,
-        "message": "Logged out."
+        "success": True
     })
 
 
-@app.route("/api/me")
-@app.route("/api/auth/me")
+@app.route("/api/auth/me", methods=["GET"])
+@app.route("/api/me", methods=["GET"])
 def me():
-    user = current_user()
-
-    if user is None:
+    if "user_id" not in session:
         return jsonify({
             "authenticated": False,
             "logged_in": False
         })
 
-    return jsonify({
-        "authenticated": True,
-        "logged_in": True,
-        "user": dict(user),
-        "farmer": {
-            "id": user["id"],
-            "farmer_name": user["name"],
-            "email": user["email"]
-        }
-    })
-
-
-# ============================================================
-# LOCATION
-# ============================================================
-
-@app.route("/api/location", methods=["GET", "POST"])
-def location():
-    if request.method == "GET":
-        return jsonify({
-            "success": True,
-            "location": get_location()
-        })
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    try:
-        latitude = number(
-            data,
-            "latitude",
-            -90,
-            90
-        )
-
-        longitude = number(
-            data,
-            "longitude",
-            -180,
-            180
-        )
-
-        saved = save_location(
-            latitude,
-            longitude,
-            data.get("source", "browser")
-        )
-
-        return jsonify({
-            "success": True,
-            "location": saved
-        })
-
-    except ValueError as exc:
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 400
-
-
-# ============================================================
-# BACKGROUND EXPLANATION
-# ============================================================
-
-def finish_explanation(prediction_id, X, result):
-    """Compute SHAP/LIME after the fast prediction response is sent."""
-    try:
-        explanation = explain(X, result)
-        with DB_LOCK:
-            conn = db()
-            conn.execute(
-                """
-                UPDATE predictions
-                SET shap_data = ?, lime_data = ?
-                WHERE id = ?
-                """,
-                (
-                    json.dumps(explanation.get("shap", [])),
-                    json.dumps(explanation.get("lime", [])),
-                    prediction_id,
-                )
-            )
-            conn.commit()
-            conn.close()
-        print(f"XAI explanation ready for prediction {prediction_id}")
-    except Exception as exc:
-        print(f"Background XAI warning for prediction {prediction_id}: {exc}")
-
-
-# ============================================================
-# PREDICTION
-# ============================================================
-
-@app.route("/api/predict", methods=["POST"])
-def predict():
-    user, error = login_required()
-
-    if error:
-        return error
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    try:
-        input_mode = str(
-            data.get(
-                "input_mode",
-                "manual"
-            )
-        ).lower()
-
-        latitude = number(
-            data,
-            "latitude",
-            -90,
-            90
-        )
-
-        longitude = number(
-            data,
-            "longitude",
-            -180,
-            180
-        )
-
-        # Live IoT mode uses the latest Arduino pH, moisture and temperature.
-        if input_mode in {"iot", "sensor", "live"}:
-            with sensor_lock:
-                live = dict(sensor_data)
-
-            if not live.get("connected"):
-                raise ValueError("Arduino sensor is not connected.")
-
-            ph = number(live, "ph", 0, 14)
-            moisture = number(live, "moisture", 0, 100)
-            temperature = number(live, "temperature", -50, 70)
-        else:
-            ph = number(data, "ph", 0, 14)
-            moisture = number(data, "moisture", 0, 100)
-            temperature = number(data, "temperature", -50, 70)
-
-        # Nitrogen and CEC remain location-derived.
-        nitrogen = raster_value(
-            RASTER_FILES["nitrogen"],
-            latitude,
-            longitude
-        )
-
-        cec = raster_value(
-            RASTER_FILES["cec"],
-            latitude,
-            longitude
-        )
-
-        values = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "ph": ph,
-            "moisture": moisture,
-            "temperature": temperature,
-            "nitrogen": nitrogen,
-            "cec": cec,
-            "input_mode": input_mode
-        }
-
-        # Fast path: run the two ML models first.
-        result, X = predict_soil(values)
-
-        # Crop rules are lightweight, so keep them in the immediate response.
-        crops = crop_advice(
-            values,
-            result["fertility"]
-        )
-
-        # Save immediately; SHAP/LIME are calculated in the background.
-        prediction_id = save_prediction(
-            result,
-            {"shap": [], "lime": []},
-            crops,
-            user["id"]
-        )
-
-        threading.Thread(
-            target=finish_explanation,
-            args=(prediction_id, X, result),
-            daemon=True
-        ).start()
-
-        return jsonify({
-            "success": True,
-            "prediction_id": prediction_id,
-            "fertility": result["fertility"],
-            "confidence": result["confidence"],
-            "input_mode": input_mode,
-            "soil": {
-                "latitude": latitude,
-                "longitude": longitude,
-                "ph": ph,
-                "moisture": moisture,
-                "temperature": temperature,
-                "nitrogen": nitrogen,
-                "cec": cec
-            },
-            "models": {
-                "lightgbm": {
-                    "prediction": result["lgb_prediction"],
-                    "confidence": result["lgb_confidence"]
-                },
-                "catboost": {
-                    "prediction": result["cat_prediction"],
-                    "confidence": result["cat_confidence"]
-                },
-                "agreement": result["model_agreement"]
-            },
-            "shap": [],
-            "lime": [],
-            "crops": crops,
-            "timestamp": result["timestamp"]
-        })
-
-    except ValueError as exc:
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 400
-
-    except Exception as exc:
-        print("Prediction error:", exc)
-
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 500
-
-
-# ============================================================
-# ARDUINO SENSOR
-# ============================================================
-
-sensor_data = {
-    "connected": False,
-    "ph": None,
-    "moisture": None,
-    "temperature": None,
-    "timestamp": None,
-    "error": "Waiting for Arduino."
-}
-
-sensor_lock = threading.Lock()
-
-def sensor_reader():
-    try:
-        import serial
-    except ImportError:
-        with sensor_lock:
-            sensor_data["error"] = "pyserial is not installed."
-        return
-
-    port = getattr(config, "SERIAL_PORT", "COM3")
-    baud = int(getattr(config, "SERIAL_BAUD", 9600))
-
-    while True:
-        ser = None
-        try:
-            ser = serial.Serial(port, baud, timeout=2)
-            time.sleep(2)
-            print(f"Arduino connected on {port} at {baud} baud")
-
-            with sensor_lock:
-                sensor_data["connected"] = True
-                sensor_data["error"] = None
-
-            while True:
-                line = ser.readline().decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-
-                if line.startswith("SOIL_SENSOR_READY") or line.startswith("DEBUG"):
-                    print("[ARDUINO]", line)
-                    continue
-
-                parts = [item.strip() for item in line.split(",")]
-
-                try:
-                    if len(parts) == 3:
-                        # NEW FORMAT: pH,moisture,temperature
-                        ph = float(parts[0])
-                        moisture = float(parts[1])
-                        temperature = float(parts[2])
-
-                        if not (0 <= ph <= 14 and 0 <= moisture <= 100 and -50 <= temperature <= 70):
-                            continue
-                        with sensor_lock:
-                            sensor_data["ph"] = ph
-                            sensor_data["moisture"] = moisture
-                            sensor_data["temperature"] = temperature
-                            sensor_data["timestamp"] = utc_now()
-                            sensor_data["connected"] = True
-                            sensor_data["error"] = None
-                        print(f"[ARDUINO] pH={ph:.2f}, Moisture={moisture:.2f}%, Temperature={temperature:.2f} C")
-                    elif len(parts) == 2:
-                        # OLD FORMAT: moisture,temperature
-                        moisture = float(parts[0])
-                        temperature = float(parts[1])
-                        if not (0 <= moisture <= 100 and -50 <= temperature <= 70):
-                            continue
-                        with sensor_lock:
-                            sensor_data["moisture"] = moisture
-                            sensor_data["temperature"] = temperature
-                            sensor_data["timestamp"] = utc_now()
-                            sensor_data["connected"] = True
-                            sensor_data["error"] = "pH not received from Arduino yet."
-                except ValueError:
-                    continue
-        except Exception as exc:
-            with sensor_lock:
-                sensor_data["connected"] = False
-                sensor_data["error"] = f"Arduino unavailable on {port}: {exc}"
-            time.sleep(3)
-        finally:
-            if ser is not None:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-
-
-threading.Thread(
-    target=sensor_reader,
-    daemon=True
-).start()
-
-
-@app.route("/api/latest")
-def latest():
-    with sensor_lock:
-        result = dict(sensor_data)
-
-    result["logged_in"] = current_user() is not None
-    return jsonify(result)
-
-
-@app.route("/api/sensor", methods=["POST"])
-def save_sensor():
-    user, error = login_required()
-
-    if error:
-        return error
-
-    data = request.get_json(
-        silent=True
-    ) or {}
-
-    try:
-        ph = data.get("ph")
-        if ph is not None and ph != "":
-            ph = number(data, "ph", 0, 14)
-
-        moisture = number(
-            data,
-            "moisture",
-            0,
-            100
-        )
-
-        temperature = number(
-            data,
-            "temperature",
-            -50,
-            70
-        )
-
-        timestamp = utc_now()
-
-        with DB_LOCK:
-            conn = db()
-
-            conn.execute(
-                """
-                INSERT INTO sensor_readings (
-                    user_id,
-                    timestamp,
-                    ph,
-                    moisture,
-                    temperature
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    user["id"],
-                    timestamp,
-                    ph,
-                    moisture,
-                    temperature
-                )
-            )
-
-            conn.commit()
-            conn.close()
-
-        return jsonify({
-            "success": True,
-            "timestamp": timestamp
-        })
-
-    except ValueError as exc:
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 400
-
-
-# ============================================================
-# PREDICTION EXPLANATION
-# ============================================================
-
-@app.route("/api/prediction/<int:prediction_id>/explanation")
-def prediction_explanation(prediction_id):
-    user, error = login_required()
-    if error:
-        return error
-
     with DB_LOCK:
         conn = db()
+
         row = conn.execute(
-            """
-            SELECT shap_data, lime_data
-            FROM predictions
-            WHERE id = ? AND user_id = ?
-            """,
-            (prediction_id, user["id"]),
-        ).fetchone()
-        conn.close()
-
-    if row is None:
-        return jsonify({"success": False, "error": "Prediction not found."}), 404
-
-    shap = json.loads(row["shap_data"] or "[]")
-    lime = json.loads(row["lime_data"] or "[]")
-    return jsonify({
-        "success": True,
-        "ready": bool(shap or lime),
-        "shap": shap,
-        "lime": lime,
-    })
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-@app.route("/api/history")
-def history():
-    user, error = login_required()
-
-    if error:
-        return error
-
-    with DB_LOCK:
-        conn = db()
-
-        rows = conn.execute(
-            """
-            SELECT
-                id,
-                timestamp,
-                latitude,
-                longitude,
-                input_mode,
-                ph,
-                moisture,
-                temperature,
-                nitrogen,
-                cec,
-                fertility,
-                confidence,
-                lgb_prediction,
-                cat_prediction,
-                lgb_confidence,
-                cat_confidence,
-                model_agreement,
-                shap_data,
-                lime_data,
-                crop_recommendation
-            FROM predictions
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 100
-            """,
-            (user["id"],)
-        ).fetchall()
-
-        conn.close()
-
-    output = []
-
-    for row in rows:
-        item = dict(row)
-
-        item["shap"] = json.loads(
-            item.pop("shap_data") or "[]"
-        )
-
-        item["lime"] = json.loads(
-            item.pop("lime_data") or "[]"
-        )
-
-        item["crops"] = json.loads(
-            item.pop("crop_recommendation") or "{}"
-        )
-
-        output.append(item)
-
-    return jsonify({
-        "success": True,
-        "history": output
-    })
-
-
-# ============================================================
-# ANALYTICS
-# ============================================================
-
-@app.route("/api/analytics")
-def analytics():
-    user, error = login_required()
-
-    if error:
-        return error
-
-    with DB_LOCK:
-        conn = db()
-
-        totals = conn.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                AVG(confidence) AS avg_confidence,
-                AVG(temperature) AS avg_temperature,
-                AVG(moisture) AS avg_moisture,
-                AVG(ph) AS avg_ph
-            FROM predictions
-            WHERE user_id = ?
-            """,
-            (user["id"],)
+            "SELECT id, name, email FROM users WHERE id = ?",
+            (session["user_id"],)
         ).fetchone()
 
-        distribution = conn.execute(
-            """
-            SELECT fertility, COUNT(*) AS count
-            FROM predictions
-            WHERE user_id = ?
-            GROUP BY fertility
-            """,
-            (user["id"],)
-        ).fetchall()
-
         conn.close()
 
     return jsonify({
-        "success": True,
-        "total_predictions": totals["total"] or 0,
-        "average_confidence": totals["avg_confidence"] or 0,
-        "average_temperature": totals["avg_temperature"] or 0,
-        "average_moisture": totals["avg_moisture"] or 0,
-        "average_ph": totals["avg_ph"] or 0,
-        "distribution": [
-            {
-                "fertility": row["fertility"],
-                "count": row["count"]
-            }
-            for row in distribution
-        ],
-        "fertility_distribution": [
-            {
-                "fertility": row["fertility"],
-                "count": row["count"]
-            }
-            for row in distribution
-        ]
+        "authenticated": bool(row),
+        "logged_in": bool(row),
+        "user": dict(row) if row else None
     })
 
 
 # ============================================================
-# WEATHER
+# LOCATION API
 # ============================================================
 
-@app.route("/api/weather")
-def weather():
-    try:
-        latitude = float(
-            request.args.get("latitude")
-        )
 
-        longitude = float(
-            request.args.get("longitude")
-        )
-
-        response = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": latitude,
-                "longitude": longitude,
-                "current": (
-                    "temperature_2m,"
-                    "relative_humidity_2m,"
-                    "precipitation,"
-                    "wind_speed_10m"
-                ),
-                "timezone": "auto"
-            },
-            timeout=10
-        )
-
-        response.raise_for_status()
-
-        return jsonify({
-            "success": True,
-            "weather": response.json()
-        })
-
-    except Exception as exc:
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 503
 
 
 # ============================================================
-# HEALTH / STATUS
+# LATEST SENSOR DATA AND STATUS
 # ============================================================
 
-@app.route("/api/health")
-def health():
-    with sensor_lock:
-        connected = sensor_data["connected"]
+@app.route("/api/latest", methods=["GET"])
+def latest():
+    with STATE_LOCK:
+        return jsonify(current)
 
+
+@app.route("/api/status", methods=["GET"])
+def status():
     return jsonify({
-        "status": "online",
-        "database": DB_FILE.exists(),
-        "models_loaded": True,
-        "temperature_models": True,
-        "features": feature_names,
-        "arduino_connected": connected,
+        "models_loaded": (
+            lgb_model is not None
+            and cat_model is not None
+        ),
+        "model_error": model_error,
+        "arduino_connected": arduino is not None,
+        "serial_port": SERIAL_PORT,
+        "serial_baud": SERIAL_BAUD,
+        "features": FEATURES,
         "shap_available": shap_explainer is not None,
         "lime_available": lime_explainer is not None,
         "real_data_only": True
     })
 
 
-@app.route("/api/status")
-def status():
-    with sensor_lock:
-        connected = sensor_data["connected"]
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "online",
+        "real_data_only": True,
+        "arduino_connected": arduino is not None,
+        "models_loaded": (
+            lgb_model is not None
+            and cat_model is not None
+        )
+    })
+
+
+# ============================================================
+# MANUAL PREDICTION API
+# ============================================================
+
+@app.route("/api/predict", methods=["POST"])
+def predict():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        latitude = float(data["latitude"])
+        longitude = float(data["longitude"])
+        ph = float(data["ph"])
+        moisture = float(data["moisture"])
+
+        temperature = data.get("temperature")
+
+        if temperature is not None:
+            temperature = float(temperature)
+
+        if not -90 <= latitude <= 90:
+            raise ValueError("Invalid latitude.")
+
+        if not -180 <= longitude <= 180:
+            raise ValueError("Invalid longitude.")
+
+        if not 0 <= ph <= 14:
+            raise ValueError("pH must be between 0 and 14.")
+
+        if not 0 <= moisture <= 100:
+            raise ValueError("Moisture must be between 0 and 100.")
+
+        values = enrich_sensor_reading(
+            ph,
+            moisture,
+            temperature,
+            latitude,
+            longitude
+        )
+
+        result, X = predict_soil(values)
+        explanation = explain_prediction(X, result)
+
+        save_prediction(result, explanation)
+
+        with STATE_LOCK:
+            current.update({
+                "reading": values,
+                "prediction": result,
+                "explanation": explanation,
+                "timestamp": result["timestamp"],
+                "error": None
+            })
+
+        return jsonify({
+            "success": True,
+            "prediction": result,
+            "explanation": explanation
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": str(exc)
+        }), 400
+
+
+# ============================================================
+# HISTORY API
+# ============================================================
+
+@app.route("/api/history", methods=["GET"])
+def history():
+    with DB_LOCK:
+        conn = db()
+
+        rows = conn.execute("""
+            SELECT
+                id,
+                timestamp,
+                latitude,
+                longitude,
+                ph,
+                moisture,
+                temperature,
+                nitrogen,
+                cec,
+                fertility,
+                confidence,
+                lgb_prediction,
+                cat_prediction,
+                lgb_confidence,
+                cat_confidence,
+                model_agreement
+            FROM predictions
+            ORDER BY id DESC
+            LIMIT 100
+        """).fetchall()
+
+        conn.close()
+
+    return jsonify([
+        dict(row) for row in rows
+    ])
+
+
+# ============================================================
+# PREDICTION EXPLANATION API
+# ============================================================
+
+@app.route(
+    "/api/prediction/<int:prediction_id>/explanation",
+    methods=["GET"]
+)
+def prediction_explanation(prediction_id):
+    with DB_LOCK:
+        conn = db()
+
+        row = conn.execute("""
+            SELECT
+                shap_data,
+                lime_data
+            FROM predictions
+            WHERE id = ?
+        """, (prediction_id,)).fetchone()
+
+        conn.close()
+
+    if not row:
+        return jsonify({
+            "success": False,
+            "error": "Prediction not found."
+        }), 404
+
+    try:
+        shap_data = json.loads(row["shap_data"] or "[]")
+        lime_data = json.loads(row["lime_data"] or "[]")
+    except Exception:
+        shap_data = []
+        lime_data = []
 
     return jsonify({
-        "models_loaded": True,
-        "temperature_models": True,
-        "features": FEATURES,
-        "arduino_connected": connected,
-        "shap_available": shap_explainer is not None,
-        "lime_available": lime_explainer is not None
+        "success": True,
+        "shap": shap_data,
+        "lime": lime_data
+    })
+
+
+# ============================================================
+# ANALYTICS API
+# ============================================================
+
+@app.route("/api/analytics", methods=["GET"])
+def analytics():
+    with DB_LOCK:
+        conn = db()
+
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                AVG(ph) AS avg_ph,
+                AVG(moisture) AS avg_moisture,
+                AVG(nitrogen) AS avg_nitrogen,
+                AVG(cec) AS avg_cec,
+                AVG(confidence) AS avg_confidence,
+                AVG(model_agreement) AS agreement
+            FROM predictions
+        """).fetchone()
+
+        distribution = conn.execute("""
+            SELECT
+                fertility,
+                COUNT(*) AS count
+            FROM predictions
+            GROUP BY fertility
+        """).fetchall()
+
+        conn.close()
+
+    return jsonify({
+        "total_predictions": row["total"] or 0,
+        "avg_ph": row["avg_ph"],
+        "avg_moisture": row["avg_moisture"],
+        "avg_nitrogen": row["avg_nitrogen"],
+        "avg_cec": row["avg_cec"],
+        "average_confidence": row["avg_confidence"],
+        "model_agreement_rate": (
+            row["agreement"] * 100
+            if row["agreement"] is not None
+            else None
+        ),
+        "fertility_distribution": [
+            dict(item) for item in distribution
+        ]
+    })
+
+
+# ============================================================
+# WEATHER API
+# ============================================================
+
+@app.route("/api/weather", methods=["GET"])
+def weather():
+    location_data = get_location()
+
+    if not location_data:
+        return jsonify({
+            "success": False,
+            "error": "Set a field location first."
+        }), 400
+
+    params = urlencode({
+        "latitude": location_data["latitude"],
+        "longitude": location_data["longitude"],
+        "current": (
+            "temperature_2m,"
+            "relative_humidity_2m,"
+            "precipitation,"
+            "wind_speed_10m"
+        ),
+        "timezone": "auto"
+    })
+
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast?"
+            + params
+        )
+
+        with urlopen(url, timeout=8) as response:
+            data = json.loads(
+                response.read().decode("utf-8")
+            )
+
+        return jsonify({
+            "success": True,
+            "location": location_data,
+            "current": data.get("current", {})
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": f"Weather service unavailable: {exc}"
+        }), 503
+
+
+# ============================================================
+# CROP RECOMMENDATION API
+# ============================================================
+
+@app.route("/api/crop-recommendations", methods=["GET"])
+def crop_recommendations():
+    with STATE_LOCK:
+        reading = current.get("reading")
+
+    if not reading or "nitrogen" not in reading:
+        return jsonify({
+            "success": False,
+            "error": "Waiting for valid soil and location data."
+        }), 409
+
+    ph = reading["ph"]
+    moisture = reading["moisture"]
+    nitrogen = reading["nitrogen"]
+    cec = reading["cec"]
+
+    candidates = [
+        (
+            "Rice",
+            6.0 <= ph <= 7.5 and moisture >= 55 and nitrogen >= 100,
+            "Prefers moist soil and moderate nitrogen."
+        ),
+        (
+            "Wheat",
+            6.0 <= ph <= 7.5
+            and 35 <= moisture <= 65
+            and nitrogen >= 100,
+            "Fits near-neutral pH with moderate moisture."
+        ),
+        (
+            "Maize",
+            5.8 <= ph <= 7.2
+            and 35 <= moisture <= 70
+            and nitrogen >= 120,
+            "Benefits from adequate nitrogen and moderate moisture."
+        ),
+        (
+            "Groundnut",
+            5.5 <= ph <= 7.0
+            and 25 <= moisture <= 60
+            and nitrogen < 500,
+            "Tolerates moderately acidic soil and moderate moisture."
+        ),
+        (
+            "Millet",
+            5.5 <= ph <= 7.5
+            and 20 <= moisture <= 55,
+            "Generally suited to lower moisture conditions."
+        )
+    ]
+
+    recommendations = []
+
+    for crop, suitable, reason in candidates:
+        score = 0
+
+        if suitable:
+            score += 2
+
+        if 6.0 <= ph <= 7.5:
+            score += 1
+
+        if 100 <= nitrogen <= 600:
+            score += 1
+
+        if cec >= 100:
+            score += 1
+
+        recommendations.append({
+            "crop": crop,
+            "score": score,
+            "suitable": suitable,
+            "reason": reason
+        })
+
+    recommendations.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
+
+    return jsonify({
+        "success": True,
+        "recommendations": recommendations[:3],
+        "basis": reading,
+        "note": (
+            "These are screening suggestions, not a substitute "
+            "for local agronomic advice."
+        )
     })
 
 
@@ -1667,35 +1417,107 @@ def status():
 # FRONTEND
 # ============================================================
 
+
+
+# ============================================================
+# FRONTEND-COMPATIBILITY ENDPOINTS
+# ============================================================
+
+@app.route("/api/validate-location", methods=["POST"])
+def validate_location():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        latitude = float(data["latitude"])
+        longitude = float(data["longitude"])
+
+        if not -90 <= latitude <= 90:
+            raise ValueError("Latitude must be between -90 and 90.")
+        if not -180 <= longitude <= 180:
+            raise ValueError("Longitude must be between -180 and 180.")
+
+        nitrogen = raster_value(
+            RASTER_FILES["nitrogen"], latitude, longitude
+        )
+        cec = raster_value(
+            RASTER_FILES["cec"], latitude, longitude
+        )
+
+        return jsonify({
+            "success": True,
+            "latitude": latitude,
+            "longitude": longitude,
+            "nitrogen": nitrogen,
+            "cec": cec
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": str(exc)
+        }), 400
+
+
+@app.route("/api/find-high-test", methods=["GET"])
+def find_high_test():
+    # A labeled High-fertility test vector is not present in the
+    # supplied CSV files. Do not fabricate one from unlabeled data.
+    return jsonify({
+        "success": False,
+        "error": (
+            "The supplied dataset does not contain a labeled "
+            "High-fertility test vector. Add a verified labeled "
+            "test record to enable this feature."
+        )
+    }), 404
+
+
 @app.route("/")
 def index():
     return send_from_directory(
-        str(ROOT_DIR / "frontend"),
+        str(FRONTEND_DIR),
         "index.html"
     )
 
 
 @app.route("/<path:path>")
 def frontend_files(path):
-    file_path = ROOT_DIR / "frontend" / path
+    requested_file = FRONTEND_DIR / path
 
-    if file_path.is_file():
+    if requested_file.is_file():
         return send_from_directory(
-            str(ROOT_DIR / "frontend"),
+            str(FRONTEND_DIR),
             path
         )
 
     return send_from_directory(
-        str(ROOT_DIR / "frontend"),
+        str(FRONTEND_DIR),
         "index.html"
     )
 
 
 # ============================================================
-# RUN
+# START APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
+
+    print("=" * 60)
+    print("SOILAI - SOIL FERTILITY PREDICTION SYSTEM")
+    print("=" * 60)
+
+    print("Serial port:", SERIAL_PORT)
+    print("Serial baud:", SERIAL_BAUD)
+    print("Model features:", FEATURES)
+    print("Models loaded:", lgb_model is not None and cat_model is not None)
+
+    connect_arduino()
+
+    threading.Thread(
+        target=sensor_loop,
+        daemon=True
+    ).start()
+
     host = getattr(
         config,
         "FLASK_HOST",
@@ -1703,22 +1525,10 @@ if __name__ == "__main__":
     )
 
     port = int(
-        getattr(
-            config,
-            "FLASK_PORT",
-            5000
-        )
+        getattr(config, "FLASK_PORT", 5000)
     )
 
-    print()
-    print("=" * 70)
-    print("SOILAI SERVER")
-    print("=" * 70)
-    print("Database:", DB_FILE)
-    print("Features:", FEATURES)
-    print("Temperature models: loaded")
-    print(f"Open: http://localhost:{port}")
-    print("=" * 70)
+    print(f"Dashboard: http://localhost:{port}")
 
     app.run(
         host=host,

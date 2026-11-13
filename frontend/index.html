@@ -66,12 +66,12 @@
         <form id="loginForm" class="auth-form">
 
             <label>
-                Username / Farmer ID / Email / Mobile
+                Username / Farmer ID
 
                 <input
                     id="loginUsername"
                     type="text"
-                    placeholder="Username, email or mobile"
+                    placeholder="Enter your username"
                     required
                 >
             </label>
@@ -596,9 +596,9 @@
                         </span>
 
                         <span>
-                            Enter the complete soil measurements for a reproducible manual test.
-                            Manual mode uses the Nitrogen and CEC values entered below.
-                            IoT/location mode can still use the location-based soil rasters.
+                            Enter the measurements available from the field.
+                            Nitrogen and CEC will be obtained from the
+                            location-based soil dataset.
                         </span>
 
                     </div>
@@ -701,91 +701,6 @@
                     </div>
 
 
-                    <div class="manual-grid manual-soil-grid">
-
-                        <div class="input-field">
-                            <label for="manualNitrogen">Nitrogen</label>
-                            <div class="input-with-unit">
-                                <input
-                                    id="manualNitrogen"
-                                    type="number"
-                                    min="0"
-                                    max="2000"
-                                    step="0.1"
-                                    placeholder="e.g. 972"
-                                >
-                                <span>N</span>
-                            </div>
-                            <small>Available nitrogen</small>
-                        </div>
-
-                        <div class="input-field">
-                            <label for="manualCec">CEC</label>
-                            <div class="input-with-unit">
-                                <input
-                                    id="manualCec"
-                                    type="number"
-                                    min="0"
-                                    max="1000"
-                                    step="0.1"
-                                    placeholder="e.g. 459"
-                                >
-                                <span>CEC</span>
-                            </div>
-                            <small>Cation exchange capacity</small>
-                        </div>
-
-                    </div>
-
-
-                    <div class="manual-grid manual-location-grid">
-
-                        <div class="input-field">
-
-                            <label for="manualLatitude">
-                                Latitude
-                            </label>
-
-                            <input
-                                id="manualLatitude"
-                                type="number"
-                                min="-90"
-                                max="90"
-                                step="0.000001"
-                                placeholder="e.g. 12.97"
-                            >
-
-                            <small>
-                                Field latitude (-90 to 90)
-                            </small>
-
-                        </div>
-
-
-                        <div class="input-field">
-
-                            <label for="manualLongitude">
-                                Longitude
-                            </label>
-
-                            <input
-                                id="manualLongitude"
-                                type="number"
-                                min="-180"
-                                max="180"
-                                step="0.000001"
-                                placeholder="e.g. 77.59"
-                            >
-
-                            <small>
-                                Field longitude (-180 to 180)
-                            </small>
-
-                        </div>
-
-                    </div>
-
-
                     <div class="input-actions">
 
                         <button
@@ -794,24 +709,6 @@
                             class="secondary-btn"
                         >
                             Use my location
-                        </button>
-
-
-                        <button
-                            id="validateLocationBtn"
-                            type="button"
-                            class="secondary-btn"
-                        >
-                            Check soil data
-                        </button>
-
-
-                        <button
-                            id="findHighTestBtn"
-                            type="button"
-                            class="secondary-btn"
-                        >
-                            Find High test
                         </button>
 
 
@@ -867,6 +764,12 @@
                     <div class="iot-readings">
 
                         <div class="iot-reading">
+                            <span>Soil pH</span>
+                            <strong id="iotPH">--</strong>
+                            <small>pH</small>
+                        </div>
+
+                        <div class="iot-reading">
 
                             <span>
                                 Moisture
@@ -910,6 +813,14 @@
                             class="secondary-btn"
                         >
                             Refresh sensor
+                        </button>
+
+                        <button
+                            id="predictIotBtn"
+                            type="button"
+                            class="primary-btn"
+                        >
+                            Predict using IoT
                         </button>
 
                     </div>
@@ -995,7 +906,7 @@
 
                     <div
                         id="temperatureValue"
-                        class="metric-value-large"
+                        class="metric-value"
                     >
                         --
                     </div>
@@ -1501,6 +1412,7 @@
         </section>
 
 
+
         <!-- =================================================
              CROP RECOMMENDATIONS
         ================================================== -->
@@ -1530,42 +1442,17 @@
 
             </div>
 
-<div
-    id="cropRecommendation"
-    class="crop-recommendation"
->
 
-    <div class="empty">
-        A valid fertility prediction is required.
-    </div>
+            <div
+                id="cropRecommendation"
+                class="crop-recommendation"
+            >
 
-</div>
+                <div class="empty">
+                    A valid fertility prediction is required.
+                </div>
 
-<div class="crop-explanation">
-
-    <h3>🔍 Why these recommendations?</h3>
-
-    <p>
-        The system uses the predicted soil fertility together with
-        pH, moisture, temperature, nitrogen and CEC to evaluate
-        crop suitability. Each recommendation includes a reason
-        explaining why the crop is suitable under the current
-        conditions.
-    </p>
-
-    <div class="crop-flow">
-
-        <span>Soil Data</span>
-        <span>→</span>
-        <span>Fertility Prediction</span>
-        <span>→</span>
-        <span>Crop Rules</span>
-        <span>→</span>
-        <span>Recommendation</span>
-
-    </div>
-
-</div>
+            </div>
 
         </section>
 
@@ -1683,9 +1570,6 @@
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script src="/js/main.js"></script>
-
-
-
 
 </body>
 </html>
