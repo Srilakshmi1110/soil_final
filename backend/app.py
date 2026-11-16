@@ -36,6 +36,9 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 import config
+from backend.advice_engine import SoilAdviceEngine
+
+ADVICE_ENGINE = SoilAdviceEngine()
 
 SERIAL_PORT = getattr(config, "SERIAL_PORT", "COM10")
 SERIAL_BAUD = int(getattr(config, "SERIAL_BAUD", 9600))
@@ -69,15 +72,14 @@ STATE_LOCK = threading.RLock()
 arduino = None
 arduino_lock = threading.Lock()
 
+# Live state is reserved exclusively for real Arduino measurements.
 current = {
     "connected": False,
     "reading": None,
-    "prediction": None,
-    "explanation": None,
-    "timestamp": None,
-    "location_source": None,
     "error": "Waiting for Arduino data."
 }
+# Latest successful prediction inputs are separate from the live IoT panel.
+last_prediction_values = None
 
 # ============================================================
 # MODEL LOADING
@@ -298,6 +300,35 @@ def init_database():
             )
         """)
 
+        # Backward-compatible username migration. Existing users and hashes remain intact.
+        user_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "username" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
+
+        # Give legacy accounts a stable generated username so they remain addressable.
+        legacy_users = conn.execute(
+            "SELECT id, name FROM users WHERE username IS NULL OR username = ''"
+        ).fetchall()
+        for legacy_user in legacy_users:
+            base = "".join(
+                ch.lower() if ch.isalnum() else "_"
+                for ch in str(legacy_user["name"]).strip()
+            ).strip("_") or "farmer"
+            generated = f"{base}_{legacy_user['id']}"
+            conn.execute(
+                "UPDATE users SET username = ? WHERE id = ?",
+                (generated, legacy_user["id"])
+            )
+
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique
+            ON users(username COLLATE NOCASE)
+            WHERE username IS NOT NULL AND username <> ''
+        """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -409,56 +440,130 @@ def get_location():
         return None
 
 
-def raster_value(path, latitude, longitude):
+
+def raster_value(path, latitude, longitude, max_radius=5):
+    """
+    Read a raster value at GPS coordinates.
+    If the exact pixel is NoData, find the nearest valid
+    pixel within max_radius cells.
+
+    Returns:
+        {
+            "value": float or None,
+            "distance_km": float or None,
+            "estimated": bool
+        }
+    """
     if not path.exists():
         raise FileNotFoundError(
-            f"Required raster file is missing: {path.name}"
+            f"Raster file missing: {path.name}"
         )
 
     with rasterio.open(path) as src:
-
         if src.crs is None:
             raise ValueError(
-                f"{path.name} does not contain a coordinate reference system."
+                f"{path.name} has no coordinate reference system."
             )
 
         xs, ys = warp_transform(
             "EPSG:4326",
             src.crs,
-            [longitude],
-            [latitude]
+            [float(longitude)],
+            [float(latitude)]
         )
 
-        row, col = src.index(xs[0], ys[0])
+        x, y = xs[0], ys[0]
+        row, col = src.index(x, y)
 
-        if (
-            row < 0
-            or col < 0
-            or row >= src.height
-            or col >= src.width
+        if not (
+            0 <= row < src.height
+            and 0 <= col < src.width
         ):
-            raise ValueError(
-                f"The selected location is outside {path.name}."
-            )
+            return {
+                "value": None,
+                "distance_km": None,
+                "estimated": False
+            }
 
-        value = src.read(
-            1,
-            window=((row, row + 1), (col, col + 1))
-        )[0, 0]
+        def read_pixel(r, c):
+            pixel = src.read(
+                1,
+                window=((r, r + 1), (c, c + 1)),
+                masked=True
+            )[0, 0]
 
-        if src.nodata is not None:
-            if np.isclose(value, src.nodata):
-                raise ValueError(
-                    f"No raster data is available in {path.name} "
-                    "for this location."
+            if np.ma.is_masked(pixel):
+                return None
+
+            value = float(pixel)
+
+            if not np.isfinite(value):
+                return None
+
+            if src.nodata is not None and np.isclose(
+                value, src.nodata
+            ):
+                return None
+
+            return value
+
+        # First try the exact GPS pixel.
+        exact_value = read_pixel(row, col)
+
+        if exact_value is not None:
+            return {
+                "value": exact_value,
+                "distance_km": 0.0,
+                "estimated": False
+            }
+
+        # Search outward, stopping at the first radius
+        # containing valid pixels.
+        for radius in range(1, max_radius + 1):
+            candidates = []
+
+            for r in range(
+                max(0, row - radius),
+                min(src.height, row + radius + 1)
+            ):
+                for c in range(
+                    max(0, col - radius),
+                    min(src.width, col + radius + 1)
+                ):
+                    if max(abs(r - row), abs(c - col)) != radius:
+                        continue
+
+                    value = read_pixel(r, c)
+
+                    if value is not None:
+                        distance = (
+                            ((r - row) * src.transform.e) ** 2
+                            + ((c - col) * src.transform.a) ** 2
+                        ) ** 0.5 / 1000.0
+
+                        candidates.append(
+                            (distance, value)
+                        )
+
+            if candidates:
+                distance, value = min(
+                    candidates,
+                    key=lambda item: item[0]
                 )
 
-        if not np.isfinite(value):
-            raise ValueError(
-                f"Invalid raster value in {path.name}."
-            )
+                return {
+                    "value": value,
+                    "distance_km": round(distance, 2),
+                    "estimated": True
+                }
 
-        return float(value)
+        return {
+            "value": None,
+            "distance_km": None,
+            "estimated": False
+        }
+
+
 
 
 def enrich_sensor_reading(ph, moisture, temperature, latitude, longitude):
@@ -694,8 +799,10 @@ def save_prediction(result, explanation):
             json.dumps(explanation.get("lime", []))
         ))
 
+        prediction_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
         conn.close()
+        return prediction_id
 
 
 # ============================================================
@@ -794,86 +901,24 @@ def read_arduino():
 # ============================================================
 
 def sensor_loop():
-    global current
-
+    """Poll Arduino; history is written only on an explicit IoT prediction."""
     while True:
         reading = read_arduino()
-
         if reading is None:
             with STATE_LOCK:
-                current["connected"] = arduino is not None
-
-                if arduino is None:
-                    current["error"] = (
-                        "Arduino disconnected. "
-                        "No simulated sensor values are used."
-                    )
-
+                current["connected"] = False
+                current["reading"] = None
+                current["error"] = "Arduino disconnected. No simulated sensor values are used."
             time.sleep(2)
             continue
-
         ph, moisture, temperature = reading
-
         with STATE_LOCK:
             current["connected"] = True
-            current["reading"] = {
-                "ph": ph,
-                "moisture": moisture,
-                "temperature": temperature
-            }
-
-        location_data = get_location()
-
-        if not location_data:
-            with STATE_LOCK:
-                current["error"] = (
-                    "Arduino is connected. "
-                    "Set your field location to obtain "
-                    "nitrogen and CEC raster values."
-                )
-
-            time.sleep(2)
-            continue
-
-        try:
-            values = enrich_sensor_reading(
-                ph,
-                moisture,
-                temperature,
-                location_data["latitude"],
-                location_data["longitude"]
-            )
-
-            result, X = predict_soil(values)
-
-            explanation = explain_prediction(
-                X,
-                result
-            )
-
-            with STATE_LOCK:
-                current = {
-                    "connected": True,
-                    "reading": values,
-                    "prediction": result,
-                    "explanation": explanation,
-                    "timestamp": result["timestamp"],
-                    "location_source": location_data.get(
-                        "source",
-                        "browser"
-                    ),
-                    "error": None
-                }
-
-        except Exception as exc:
-            with STATE_LOCK:
-                current["connected"] = True
-                current["error"] = str(exc)
-
+            current["reading"] = {"ph": ph, "moisture": moisture, "temperature": temperature}
+            current["error"] = None
         time.sleep(2)
 
 
-# ============================================================
 # AUTHENTICATION API
 # ============================================================
 
@@ -883,106 +928,103 @@ def signup():
     data = request.get_json(silent=True) or {}
 
     name = str(data.get("name", "")).strip()
-    email = str(data.get("email", "")).strip().lower()
+    username = str(data.get("username", "")).strip()
+    contact = str(
+        data.get("email") or data.get("contact") or data.get("mobile") or ""
+    ).strip()
     password = str(data.get("password", ""))
 
-    if not name or not email or len(password) < 6:
+    if not name or not username or not contact or len(password) < 6:
         return jsonify({
             "success": False,
-            "error": (
-                "Name, email and a password of at least "
-                "6 characters are required."
-            )
+            "error": "Name, username, email/mobile and a password of at least 6 characters are required."
         }), 400
 
+    conn = None
     try:
         with DB_LOCK:
             conn = db()
+            existing = conn.execute("""
+                SELECT id FROM users
+                WHERE lower(username) = lower(?) OR lower(email) = lower(?)
+                LIMIT 1
+            """, (username, contact)).fetchone()
+            if existing:
+                return jsonify({
+                    "success": False,
+                    "error": "That username or email/mobile is already registered."
+                }), 409
 
             cursor = conn.execute("""
-                INSERT INTO users (
-                    name,
-                    email,
-                    password_hash
-                )
-                VALUES (?, ?, ?)
-            """, (
-                name,
-                email,
-                hash_password(password)
-            ))
-
+                INSERT INTO users (name, username, email, password_hash)
+                VALUES (?, ?, ?, ?)
+            """, (name, username, contact, hash_password(password)))
             conn.commit()
             user_id = cursor.lastrowid
-            conn.close()
 
         session["user_id"] = user_id
         session["user_name"] = name
-
         return jsonify({
             "success": True,
+            "logged_in": True,
             "user": {
                 "id": user_id,
                 "name": name,
-                "email": email
+                "username": username,
+                "email": contact
             }
         })
-
     except sqlite3.IntegrityError:
+        if conn:
+            conn.rollback()
         return jsonify({
             "success": False,
-            "error": "An account with that email already exists."
+            "error": "That username or email/mobile is already registered."
         }), 409
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/api/auth/login", methods=["POST"])
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
-
-    email = str(
-        data.get("email")
-        or data.get("username")
-        or data.get("identifier")
-        or ""
-    ).strip().lower()
-
+    identifier = str(
+        data.get("username") or data.get("identifier") or data.get("email") or ""
+    ).strip()
     password = str(data.get("password", ""))
 
-    if not email or not password:
+    if not identifier or not password:
         return jsonify({
             "success": False,
-            "error": "Enter your email and password."
+            "error": "Enter your username/email and password."
         }), 400
 
     with DB_LOCK:
         conn = db()
-
-        row = conn.execute(
-            "SELECT * FROM users WHERE lower(email) = ?",
-            (email,)
-        ).fetchone()
-
+        row = conn.execute("""
+            SELECT * FROM users
+            WHERE lower(username) = lower(?) OR lower(email) = lower(?)
+            LIMIT 1
+        """, (identifier, identifier)).fetchone()
         conn.close()
 
-    if not row or not verify_password(
-        password,
-        row["password_hash"]
-    ):
+    if not row or not verify_password(password, row["password_hash"]):
         return jsonify({
             "success": False,
-            "error": "Invalid email or password."
+            "error": "Invalid username/email or password."
         }), 401
 
     session["user_id"] = row["id"]
     session["user_name"] = row["name"]
-
     return jsonify({
         "success": True,
         "logged_in": True,
         "user": {
             "id": row["id"],
             "name": row["name"],
+            "username": row["username"],
             "email": row["email"]
         }
     })
@@ -1011,7 +1053,7 @@ def me():
         conn = db()
 
         row = conn.execute(
-            "SELECT id, name, email FROM users WHERE id = ?",
+            "SELECT id, name, username, email FROM users WHERE id = ?",
             (session["user_id"],)
         ).fetchone()
 
@@ -1038,7 +1080,22 @@ def me():
 @app.route("/api/latest", methods=["GET"])
 def latest():
     with STATE_LOCK:
-        return jsonify(current)
+        connected = bool(current.get("connected"))
+        reading = dict(current.get("reading") or {}) if connected else {}
+        error = current.get("error")
+    location_data = get_location() if connected else None
+    nitrogen = cec = None
+    if location_data:
+        nitrogen = raster_value(RASTER_FILES["nitrogen"], location_data["latitude"], location_data["longitude"])
+        cec = raster_value(RASTER_FILES["cec"], location_data["latitude"], location_data["longitude"])
+    return jsonify({
+        "ph": reading.get("ph"), "moisture": reading.get("moisture"),
+        "temperature": reading.get("temperature"), "nitrogen": nitrogen, "cec": cec,
+        "latitude": location_data.get("latitude") if location_data else None,
+        "longitude": location_data.get("longitude") if location_data else None,
+        "connected": connected, "sensor_connected": connected, "error": error,
+        "timestamp": utc_now() if connected and reading else None
+    })
 
 
 @app.route("/api/status", methods=["GET"])
@@ -1076,69 +1133,84 @@ def health():
 # MANUAL PREDICTION API
 # ============================================================
 
+def build_crop_recommendations(soil_values):
+    """Adapt the existing advice engine output for the frontend display."""
+    ranked = ADVICE_ENGINE.recommend_crops(soil_values)
+    recommendations = []
+    for item in ranked:
+        evaluated = int(item.get("evaluated_parameters", 0) or 0)
+        matched = int(item.get("matched_parameters", 0) or 0)
+        score = float(item.get("score", 0) or 0)
+        recommendations.append({
+            "crop": item.get("crop", "Crop"),
+            "score": score,
+            "suitability": f"{score:.0f}% suitability match",
+            "matched_conditions": matched,
+            "total_conditions": evaluated,
+            "reason": item.get("reason", "Based on available soil measurements."),
+            "conditions": {}
+        })
+    return recommendations
+
+
 @app.route("/api/predict", methods=["POST"])
 def predict():
+    global last_prediction_values
     data = request.get_json(silent=True) or {}
-
     try:
-        latitude = float(data["latitude"])
-        longitude = float(data["longitude"])
-        ph = float(data["ph"])
-        moisture = float(data["moisture"])
+        latitude, longitude = float(data["latitude"]), float(data["longitude"])
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            raise ValueError("Latitude or longitude is outside its valid range.")
+        input_mode = str(data.get("input_mode", "manual")).lower()
+        if input_mode not in ("manual", "iot"):
+            raise ValueError("input_mode must be 'manual' or 'iot'.")
 
-        temperature = data.get("temperature")
+        if input_mode == "iot":
+            with STATE_LOCK:
+                sensor_reading = dict(current.get("reading") or {})
+                sensor_connected = bool(current.get("connected"))
+            if not sensor_connected or not sensor_reading:
+                raise ValueError("Arduino is not connected or has not provided a complete reading.")
+            ph = float(sensor_reading["ph"])
+            moisture = float(sensor_reading["moisture"])
+            temperature = sensor_reading.get("temperature")
+            values = enrich_sensor_reading(ph, moisture, temperature, latitude, longitude)
+        else:
+            ph, moisture = float(data["ph"]), float(data["moisture"])
+            temperature = data.get("temperature")
+            temperature = float(temperature) if temperature not in (None, "") else None
+            nitrogen, cec = float(data["nitrogen"]), float(data["cec"])
+            if not 0 <= ph <= 14: raise ValueError("pH must be between 0 and 14.")
+            if not 0 <= moisture <= 100: raise ValueError("Moisture must be between 0 and 100.")
+            if temperature is not None and not -50 <= temperature <= 70:
+                raise ValueError("Temperature must be between -50 and 70 °C.")
+            if nitrogen < 0 or cec < 0: raise ValueError("Nitrogen and CEC must be non-negative.")
+            values = {"latitude": latitude, "longitude": longitude, "ph": ph,
+                      "moisture": moisture, "nitrogen": nitrogen, "cec": cec}
+            if temperature is not None: values["temperature"] = temperature
 
-        if temperature is not None:
-            temperature = float(temperature)
-
-        if not -90 <= latitude <= 90:
-            raise ValueError("Invalid latitude.")
-
-        if not -180 <= longitude <= 180:
-            raise ValueError("Invalid longitude.")
-
-        if not 0 <= ph <= 14:
-            raise ValueError("pH must be between 0 and 14.")
-
-        if not 0 <= moisture <= 100:
-            raise ValueError("Moisture must be between 0 and 100.")
-
-        values = enrich_sensor_reading(
-            ph,
-            moisture,
-            temperature,
-            latitude,
-            longitude
-        )
-
+        missing = [name for name in FEATURES if name not in values or values[name] is None]
+        if missing: raise ValueError("Required model inputs are missing: " + ", ".join(missing))
         result, X = predict_soil(values)
         explanation = explain_prediction(X, result)
-
-        save_prediction(result, explanation)
-
+        prediction_id = save_prediction(result, explanation)
         with STATE_LOCK:
-            current.update({
-                "reading": values,
-                "prediction": result,
-                "explanation": explanation,
-                "timestamp": result["timestamp"],
-                "error": None
-            })
+            last_prediction_values = dict(values)
 
+        crop_recommendations = build_crop_recommendations(values)
+        advice = ADVICE_ENGINE.generate_advice(values)
         return jsonify({
-            "success": True,
-            "prediction": result,
-            "explanation": explanation
+            "success": True, "prediction_id": prediction_id, "input_mode": input_mode,
+            "prediction": result, "explanation": explanation, "soil": values,
+            "crop_recommendations": crop_recommendations,
+            "crops": {"summary": "Crop suitability is screened using the soil measurements available for this prediction.",
+                      "recommendations": crop_recommendations},
+            "soil_advice": advice
         })
-
     except Exception as exc:
-        return jsonify({
-            "success": False,
-            "error": str(exc)
-        }), 400
+        return jsonify({"success": False, "error": str(exc)}), 400
 
 
-# ============================================================
 # HISTORY API
 # ============================================================
 
@@ -1172,9 +1244,8 @@ def history():
 
         conn.close()
 
-    return jsonify([
-        dict(row) for row in rows
-    ])
+    records = [dict(row) for row in rows]
+    return jsonify({"success": True, "history": records, "predictions": records, "records": records})
 
 
 # ============================================================
@@ -1324,104 +1395,168 @@ def weather():
 
 @app.route("/api/crop-recommendations", methods=["GET"])
 def crop_recommendations():
+    """Return crop screening for the latest successful manual or IoT prediction."""
     with STATE_LOCK:
-        reading = current.get("reading")
+        reading = dict(last_prediction_values) if last_prediction_values else None
 
-    if not reading or "nitrogen" not in reading:
-        return jsonify({
-            "success": False,
-            "error": "Waiting for valid soil and location data."
-        }), 409
+    if not reading:
+        with DB_LOCK:
+            conn = db()
+            row = conn.execute("""
+                SELECT latitude, longitude, ph, moisture, temperature, nitrogen, cec
+                FROM predictions
+                ORDER BY id DESC
+                LIMIT 1
+            """).fetchone()
+            conn.close()
+        if row:
+            reading = dict(row)
 
-    ph = reading["ph"]
-    moisture = reading["moisture"]
-    nitrogen = reading["nitrogen"]
-    cec = reading["cec"]
-
-    candidates = [
-        (
-            "Rice",
-            6.0 <= ph <= 7.5 and moisture >= 55 and nitrogen >= 100,
-            "Prefers moist soil and moderate nitrogen."
-        ),
-        (
-            "Wheat",
-            6.0 <= ph <= 7.5
-            and 35 <= moisture <= 65
-            and nitrogen >= 100,
-            "Fits near-neutral pH with moderate moisture."
-        ),
-        (
-            "Maize",
-            5.8 <= ph <= 7.2
-            and 35 <= moisture <= 70
-            and nitrogen >= 120,
-            "Benefits from adequate nitrogen and moderate moisture."
-        ),
-        (
-            "Groundnut",
-            5.5 <= ph <= 7.0
-            and 25 <= moisture <= 60
-            and nitrogen < 500,
-            "Tolerates moderately acidic soil and moderate moisture."
-        ),
-        (
-            "Millet",
-            5.5 <= ph <= 7.5
-            and 20 <= moisture <= 55,
-            "Generally suited to lower moisture conditions."
-        )
-    ]
-
-    recommendations = []
-
-    for crop, suitable, reason in candidates:
-        score = 0
-
-        if suitable:
-            score += 2
-
-        if 6.0 <= ph <= 7.5:
-            score += 1
-
-        if 100 <= nitrogen <= 600:
-            score += 1
-
-        if cec >= 100:
-            score += 1
-
-        recommendations.append({
-            "crop": crop,
-            "score": score,
-            "suitable": suitable,
-            "reason": reason
-        })
-
-    recommendations.sort(
-        key=lambda item: item["score"],
-        reverse=True
-    )
-
+    if not reading:
+        return jsonify({"success": False,
+                        "error": "Run a soil prediction first to generate crop recommendations."}), 409
+    recommendations = build_crop_recommendations(reading)
+    advice = ADVICE_ENGINE.generate_advice(reading)
     return jsonify({
-        "success": True,
-        "recommendations": recommendations[:3],
-        "basis": reading,
-        "note": (
-            "These are screening suggestions, not a substitute "
-            "for local agronomic advice."
-        )
+        "success": True, "recommendations": recommendations,
+        "crop_recommendations": recommendations,
+        "crops": {"recommendations": recommendations},
+        "soil_advice": advice, "basis": reading,
+        "note": advice.get("disclaimer")
     })
 
 
-# ============================================================
-# FRONTEND
-# ============================================================
-
-
-
-# ============================================================
 # FRONTEND-COMPATIBILITY ENDPOINTS
 # ============================================================
+
+
+
+@app.route("/api/location", methods=["GET", "POST"])
+def location_api():
+    if request.method == "GET":
+        return jsonify({
+            "success": True,
+            "location": get_location()
+        })
+
+    data = request.get_json(silent=True) or {}
+
+    try:
+        latitude = float(data["latitude"])
+        longitude = float(data["longitude"])
+
+        if not -90 <= latitude <= 90:
+            raise ValueError("Invalid latitude.")
+
+        if not -180 <= longitude <= 180:
+            raise ValueError("Invalid longitude.")
+
+        location = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "source": str(data.get("source", "browser")),
+            "updated_at": utc_now()
+        }
+
+        # Save GPS even if raster data is unavailable.
+        with DB_LOCK:
+            conn = db()
+            conn.execute(
+                "INSERT INTO app_state(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("location", json.dumps(location))
+            )
+            conn.commit()
+            conn.close()
+
+        raster_results = {}
+        raster_errors = []
+
+        for name, path in RASTER_FILES.items():
+            try:
+                result = raster_value(
+                    path,
+                    latitude,
+                    longitude,
+                    max_radius=5
+                )
+
+                raster_results[name] = result
+
+                if result["value"] is None:
+                    raster_errors.append(
+                        f"No valid {name} data within the search distance."
+                    )
+
+            except Exception as exc:
+                raster_results[name] = {
+                    "value": None,
+                    "distance_km": None,
+                    "estimated": False
+                }
+                raster_errors.append(f"{name}: {exc}")
+
+        nitrogen_result = raster_results.get(
+            "nitrogen", {"value": None}
+        )
+        cec_result = raster_results.get(
+            "cec", {"value": None}
+        )
+
+        nitrogen = nitrogen_result["value"]
+        cec = cec_result["value"]
+
+        raster_available = (
+            nitrogen is not None and cec is not None
+        )
+
+        estimated = (
+            nitrogen_result.get("estimated", False)
+            or cec_result.get("estimated", False)
+        )
+
+        return jsonify({
+            "success": True,
+            "location": location,
+            "latitude": latitude,
+            "longitude": longitude,
+
+            # Keep these numeric for frontend compatibility.
+            "nitrogen": nitrogen,
+            "cec": cec,
+
+            "nitrogen_distance_km":
+                nitrogen_result.get("distance_km"),
+            "cec_distance_km":
+                cec_result.get("distance_km"),
+
+            "nitrogen_estimated":
+                nitrogen_result.get("estimated", False),
+            "cec_estimated":
+                cec_result.get("estimated", False),
+
+            "raster_available": raster_available,
+            "estimated": estimated,
+
+            "raster_message": (
+                "GPS detected. Nearby soil raster values retrieved."
+                if raster_available and estimated
+                else "GPS detected. Exact soil raster values retrieved."
+                if raster_available
+                else "GPS detected, but one or more raster values "
+                     "are unavailable. Manual entry is still available."
+            ),
+
+            "raster_errors": raster_errors
+        })
+
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({
+            "success": False,
+            "error": str(exc)
+        }), 400
+
+
 
 @app.route("/api/validate-location", methods=["POST"])
 def validate_location():
@@ -1432,23 +1567,42 @@ def validate_location():
         longitude = float(data["longitude"])
 
         if not -90 <= latitude <= 90:
-            raise ValueError("Latitude must be between -90 and 90.")
-        if not -180 <= longitude <= 180:
-            raise ValueError("Longitude must be between -180 and 180.")
+            raise ValueError("Invalid latitude.")
 
-        nitrogen = raster_value(
-            RASTER_FILES["nitrogen"], latitude, longitude
+        if not -180 <= longitude <= 180:
+            raise ValueError("Invalid longitude.")
+
+        nitrogen_result = raster_value(
+            RASTER_FILES["nitrogen"],
+            latitude,
+            longitude,
+            max_radius=5
         )
-        cec = raster_value(
-            RASTER_FILES["cec"], latitude, longitude
+
+        cec_result = raster_value(
+            RASTER_FILES["cec"],
+            latitude,
+            longitude,
+            max_radius=5
         )
 
         return jsonify({
             "success": True,
             "latitude": latitude,
             "longitude": longitude,
-            "nitrogen": nitrogen,
-            "cec": cec
+
+            "nitrogen": nitrogen_result["value"],
+            "cec": cec_result["value"],
+
+            "nitrogen_distance_km":
+                nitrogen_result["distance_km"],
+            "cec_distance_km":
+                cec_result["distance_km"],
+
+            "nitrogen_estimated":
+                nitrogen_result["estimated"],
+            "cec_estimated":
+                cec_result["estimated"]
         })
 
     except Exception as exc:

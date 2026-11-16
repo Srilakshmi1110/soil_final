@@ -596,13 +596,14 @@
                         </span>
 
                         <span>
-                            Enter the measurements available from the field.
-                            Nitrogen and CEC will be obtained from the
-                            location-based soil dataset.
+                            Enter pH, moisture, temperature, nitrogen and CEC. GPS coordinates are detected automatically.
                         </span>
 
                     </div>
 
+
+                    <input id="manualLatitude" type="hidden">
+                    <input id="manualLongitude" type="hidden">
 
                     <div class="manual-grid">
 
@@ -696,6 +697,24 @@
                                 Field temperature
                             </small>
 
+                        </div>
+
+                        <div class="input-field">
+                            <label for="manualNitrogen">Nitrogen</label>
+                            <div class="input-with-unit">
+                                <input id="manualNitrogen" type="number" min="0" step="0.01" placeholder="e.g. 174">
+                                <span>N</span>
+                            </div>
+                            <small>Enter measured nitrogen value</small>
+                        </div>
+
+                        <div class="input-field">
+                            <label for="manualCec">CEC</label>
+                            <div class="input-with-unit">
+                                <input id="manualCec" type="number" min="0" step="0.01" placeholder="e.g. 140">
+                                <span>CEC</span>
+                            </div>
+                            <small>Cation exchange capacity</small>
                         </div>
 
                     </div>
@@ -800,6 +819,18 @@
                                 °C
                             </small>
 
+                        </div>
+
+                        <div class="iot-reading">
+                            <span>Nitrogen (location raster)</span>
+                            <strong id="iotNitrogen">--</strong>
+                            <small>N</small>
+                        </div>
+
+                        <div class="iot-reading">
+                            <span>CEC (location raster)</span>
+                            <strong id="iotCec">--</strong>
+                            <small>CEC</small>
                         </div>
 
                     </div>
@@ -1569,7 +1600,7 @@
 
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script src="/js/main.js"></script>
+<script src="/js/main.js?v=soil-history-iot-crops-2"></script>
 
 </body>
 </html>

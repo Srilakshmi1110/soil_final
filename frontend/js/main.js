@@ -323,7 +323,10 @@ function switchPage(page) {
     if (page === "analytics") loadAnalytics();
     if (page === "history") loadHistory();
     if (page === "explainability") renderExplainability(latestPrediction);
-    if (page === "crops") renderCrops(latestPrediction);
+    if (page === "crops") {
+        if (latestPrediction) renderCrops(latestPrediction);
+        else loadCropRecommendations();
+    }
 }
 
 
@@ -376,32 +379,28 @@ function setInputMode(mode) {
 ========================================================= */
 
 async function setupLocation() {
-    $("useLocationBtn").addEventListener(
-        "click",
-        requestLocation
-    );
+    const useLocationButton = $("useLocationBtn");
+    if (useLocationButton) useLocationButton.addEventListener("click", requestLocation);
 
-    $("validateLocationBtn").addEventListener(
-        "click",
-        validateManualLocation
-    );
+    const validateLocationButton = $("validateLocationBtn");
+    if (validateLocationButton) validateLocationButton.addEventListener("click", validateManualLocation);
 
-    $("findHighTestBtn").addEventListener(
-        "click",
-        findHighTest
-    );
+    const highTestButton = $("findHighTestBtn");
+    if (highTestButton) highTestButton.addEventListener("click", findHighTest);
 
     await loadSavedLocation();
+    requestLocation();
 }
 
-function requestLocation() {
+
+async function requestLocation() {
     if (!navigator.geolocation) {
         showToast("Location is not supported by this browser.");
         return;
     }
 
     navigator.geolocation.getCurrentPosition(
-        (position) => {
+        async (position) => {
             currentLocation = {
                 latitude: position.coords.latitude,
                 longitude: position.coords.longitude
@@ -410,27 +409,67 @@ function requestLocation() {
             setManualLocationFields();
             updateLocationDisplay();
 
-            getJSON("/api/location", {
-                method: "POST",
-                body: JSON.stringify({
-                    latitude: currentLocation.latitude,
-                    longitude: currentLocation.longitude,
-                    source: "browser"
-                })
-            }).catch(() => {});
+            try {
+                const saved = await getJSON("/api/location", {
+                    method: "POST",
+                    body: JSON.stringify({
+                        ...currentLocation,
+                        source: "browser"
+                    })
+                });
 
-            showToast("Location updated.");
+                // Update manual raster fields only when values exist.
+                if (saved.nitrogen != null) {
+                    $("nitrogenValue").textContent =
+                        formatNumber(saved.nitrogen, 2);
+                }
+
+                if (saved.cec != null) {
+                    $("cecValue").textContent =
+                        formatNumber(saved.cec, 2);
+                }
+
+                // Do not populate the IoT panel with raster or
+                // manually entered values. It is sensor-only.
+                await loadWeather();
+
+                if (saved.raster_available) {
+                    showToast(
+                        "GPS detected and soil raster values loaded."
+                    );
+                } else {
+                    showToast(
+                        "GPS detected. Soil raster values are unavailable "
+                        + "at this location. Manual entry is available."
+                    );
+                }
+
+            } catch (error) {
+                showToast(
+                    "GPS detected, but the location could not be saved: "
+                    + error.message
+                );
+            }
         },
-        () => {
-            showToast("Location permission was not available.");
+        (error) => {
+            const messages = {
+                1: "Location permission denied. Allow location access in Chrome.",
+                2: "Your device could not determine the location.",
+                3: "Location request timed out. Try again."
+            };
+
+            showToast(
+                messages[error.code] || "Location detection failed."
+            );
         },
         {
             enableHighAccuracy: true,
-            timeout: 10000,
+            timeout: 20000,
             maximumAge: 60000
         }
     );
 }
+
 
 async function loadSavedLocation() {
     try {
@@ -724,6 +763,8 @@ async function submitManualPrediction() {
         }
 
         handlePrediction(data);
+        await loadHistory();
+        await loadAnalytics();
 
         if (data.prediction_id) {
             loadPredictionExplanation(data.prediction_id);
@@ -774,6 +815,8 @@ async function submitIoTPrediction() {
         if (data.success === false) throw new Error(data.error || "Prediction failed.");
         handlePrediction(data);
         if (data.prediction_id != null) loadPredictionExplanation(data.prediction_id);
+        await loadHistory();
+        await loadAnalytics();
         showToast("IoT soil fertility prediction completed.");
     } catch (error) {
         showToast(error.message);
@@ -789,142 +832,33 @@ async function submitIoTPrediction() {
 
 // Display all three sensor values in the IoT sensing panel.
 async function refreshLatest() {
+    const ids = ["iotPH", "iotMoisture", "iotTemperature", "iotNitrogen", "iotCec"];
     try {
         const data = await getJSON("/api/latest");
-
         if (!data) return;
-
         updateSensorStatus(data);
-
-        // -----------------------------------------------
-        // PH SENSOR
-        // -----------------------------------------------
-
-        if (
-            data.ph !== undefined &&
-            data.ph !== null &&
-            data.ph !== ""
-        ) {
-            const ph = formatNumber(data.ph, 2);
-
-            if ($("iotPH")) {
-                $("iotPH").textContent = ph;
-            }
-
-            if ($("phValue")) {
-                $("phValue").textContent = ph;
-            }
-        }
-
-        // -----------------------------------------------
-        // MOISTURE SENSOR
-        // -----------------------------------------------
-
-        if (
-            data.moisture !== undefined &&
-            data.moisture !== null &&
-            data.moisture !== ""
-        ) {
-            const moisture = formatNumber(
-                data.moisture,
-                1
-            );
-
-            if ($("iotMoisture")) {
-                $("iotMoisture").textContent = moisture;
-            }
-
-            if ($("moistureValue")) {
-                $("moistureValue").textContent =
-                    `${moisture} %`;
-            }
-        }
-
-        // -----------------------------------------------
-        // TEMPERATURE SENSOR
-        // -----------------------------------------------
-
-        if (
-            data.temperature !== undefined &&
-            data.temperature !== null &&
-            data.temperature !== ""
-        ) {
-            const temperature = formatNumber(
-                data.temperature,
-                1
-            );
-
-            if ($("iotTemperature")) {
-                $("iotTemperature").textContent =
-                    temperature;
-            }
-
-            if ($("temperatureValue")) {
-                $("temperatureValue").textContent =
-                    `${temperature} °C`;
-            }
-        }
-
-        // -----------------------------------------------
-        // NITROGEN
-        // -----------------------------------------------
-
-        if (
-            data.nitrogen !== undefined &&
-            data.nitrogen !== null
-        ) {
-            $("nitrogenValue").textContent =
-                formatNumber(data.nitrogen, 2);
-        }
-
-        // -----------------------------------------------
-        // CEC
-        // -----------------------------------------------
-
-        if (
-            data.cec !== undefined &&
-            data.cec !== null
-        ) {
-            $("cecValue").textContent =
-                formatNumber(data.cec, 2);
-        }
-
-        // -----------------------------------------------
-        // LOCATION
-        // -----------------------------------------------
-
-        if (
-            data.latitude !== undefined &&
-            data.latitude !== null &&
-            data.longitude !== undefined &&
-            data.longitude !== null
-        ) {
-            currentLocation = {
-                latitude: Number(data.latitude),
-                longitude: Number(data.longitude)
-            };
-
+        const connected = data.sensor_connected === true || data.connected === true;
+        const values = {
+            iotPH: data.ph == null ? "--" : formatNumber(data.ph, 2),
+            iotMoisture: data.moisture == null ? "--" : `${formatNumber(data.moisture, 1)} %`,
+            iotTemperature: data.temperature == null ? "--" : `${formatNumber(data.temperature, 1)} °C`,
+            iotNitrogen: data.nitrogen == null ? "--" : formatNumber(data.nitrogen, 2),
+            iotCec: data.cec == null ? "--" : formatNumber(data.cec, 2)
+        };
+        ids.forEach(id => {
+            const element = $(id);
+            if (element) element.textContent = connected ? values[id] : "--";
+        });
+        if (data.latitude != null && data.longitude != null) {
+            currentLocation = { latitude: Number(data.latitude), longitude: Number(data.longitude) };
             updateLocationDisplay();
         }
-
-        // -----------------------------------------------
-        // PREDICTION
-        // -----------------------------------------------
-
-        if (data.fertility) {
-            handlePrediction(data);
-        }
-
     } catch (error) {
-        console.error("Sensor refresh error:", error);
-        updateConnection(false);
+        console.error("Unable to refresh live sensor values:", error);
+        ids.forEach(id => { const element = $(id); if (element) element.textContent = "--"; });
     }
 }
 
-
-/* =========================================================
-   SENSOR CONNECTION STATUS
-========================================================= */
 
 function updateSensorStatus(data) {
     const connected =
@@ -995,6 +929,15 @@ async function loadPredictionExplanation(predictionId) {
 ========================================================= */
 
 function handlePrediction(data) {
+    if (data?.prediction && typeof data.prediction === "object") {
+        data = {
+            ...data,
+            ...data.prediction,
+            shap: data.explanation?.shap ?? data.prediction.shap,
+            lime: data.explanation?.lime ?? data.prediction.lime
+        };
+    }
+
     latestPrediction = data;
 
     const soil =
@@ -1237,6 +1180,19 @@ function renderExplainability(data) {
    CROP RECOMMENDATIONS
 ========================================================= */
 
+async function loadCropRecommendations() {
+    const container = $("cropRecommendation");
+    if (!container) return;
+    try {
+        const data = await getJSON("/api/crop-recommendations");
+        if (data.success === false) throw new Error(data.error || "No crop recommendations yet.");
+        renderCrops(data);
+    } catch (error) {
+        container.innerHTML = `<div class="empty">${escapeHTML(error.message)}</div>`;
+    }
+}
+
+
 function renderCrops(data) {
     const container = $("cropRecommendation");
 
@@ -1331,12 +1287,9 @@ async function loadHistory() {
     try {
         const data = await getJSON("/api/history");
 
-        const rows =
-            data.history ||
-            data.predictions ||
-            data.records ||
-            [];
-
+        const rows = Array.isArray(data)
+            ? data
+            : (data.history || data.predictions || data.records || []);
         latestHistory = Array.isArray(rows) ? rows : [];
 
         renderHistory(latestHistory);
@@ -1456,18 +1409,16 @@ async function loadAnalytics() {
 
         updateAnalyticsStats(data);
 
-        let historyData = { history: [] };
-
+        let historyData = [];
         try {
             historyData = await getJSON("/api/history");
         } catch {
-            historyData = { history: [] };
+            historyData = [];
         }
-
-        renderAnalyticsCharts({
-            ...data,
-            sensor_history: historyData.history || []
-        });
+        const historyRows = Array.isArray(historyData)
+            ? historyData
+            : (historyData.history || historyData.predictions || historyData.records || []);
+        renderAnalyticsCharts({ ...data, sensor_history: historyRows });
 
     } catch (error) {
         console.error("Analytics error:", error);
