@@ -5,7 +5,7 @@
     --panel-2: #132319;
     --border: #24362a;
 
-    --text: #eef5ef;
+    --text: #eef5ef; 
     --muted: #8d9b91;
     --muted-2: #68766d;
 
@@ -1124,11 +1124,78 @@ button {
    CROPS
 ========================================================= */
 
+
 .crop-recommendation {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 14px;
+    display: block;
+    width: 100%;
 }
+
+.crop-summary {
+    margin-bottom: 18px;
+    line-height: 1.6;
+}
+
+.crop-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 16px;
+    width: 100%;
+}
+
+.crop-card {
+    min-width: 0;
+    padding: 22px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.crop-recommendation-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.crop-card h3 {
+    margin: 0 0 8px;
+    font-size: 17px;
+}
+
+.crop-suitability {
+    display: block;
+    margin-bottom: 5px;
+}
+
+.crop-score {
+    color: var(--accent);
+    font-size: 12px;
+    margin-top: 6px;
+}
+
+.crop-recommendation-reason {
+    margin-top: 16px;
+    line-height: 1.6;
+}
+
+.crop-recommendation-reason p {
+    color: var(--muted);
+    margin-top: 8px;
+}
+
+.crop-conditions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+@media (max-width: 700px) {
+    .crop-list {
+        grid-template-columns: 1fr;
+    }
+}
+
 
 .crop-card {
     padding: 20px;
@@ -1397,3 +1464,180 @@ body.light-theme .primary-btn {
         flex: 1;
     }
 }
+/* SoilAI input refinements */
+.manual-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.iot-readings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.input-field input:focus { outline: 2px solid rgba(40,116,59,.22); border-color: var(--accent-strong); }
+@media (max-width: 900px) { .manual-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .manual-grid, .iot-readings { grid-template-columns: 1fr; } }
+
+
+/* =========================================
+   FARMER-FRIENDLY OVERVIEW DASHBOARD
+   New styles - existing styles preserved
+========================================= */
+
+.page#page-overview.active-page {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+}
+#page-overview .section-heading {
+    margin-top: 8px;
+    margin-bottom: 12px;
+}
+
+#page-overview .section-heading h2 {
+    font-size: 21px;
+    letter-spacing: -0.3px;
+}
+
+#page-overview .section-heading p {
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+/* Fertility and weather panels */
+
+#page-overview .hero-grid {
+    gap: 18px;
+}
+
+#page-overview .prediction-panel,
+#page-overview .weather-panel {
+    min-height: 190px;
+    border-radius: 18px;
+    padding: 26px;
+}
+
+#page-overview .fertility-value {
+    font-size: clamp(30px, 4vw, 42px);
+    font-weight: 750;
+    letter-spacing: -1px;
+}
+
+#page-overview .fertility-message,
+#page-overview .muted {
+    line-height: 1.6;
+}
+
+/* Soil input panel */
+
+#page-overview .input-panel {
+    border-radius: 18px;
+    overflow: hidden;
+}
+
+#page-overview .input-mode-row {
+    padding: 20px 22px;
+}
+
+#page-overview .input-title {
+    font-size: 17px;
+    font-weight: 700;
+}
+
+#page-overview .input-subtitle {
+    line-height: 1.6;
+}
+
+/* Manual input fields */
+
+#page-overview .manual-grid {
+    gap: 18px;
+}
+
+#page-overview .input-field input {
+    min-height: 46px;
+    border-radius: 10px;
+}
+
+/* IoT readings */
+
+#page-overview .iot-readings {
+    gap: 14px;
+}
+
+#page-overview .iot-reading {
+    min-height: 105px;
+    border-radius: 13px;
+    padding: 16px;
+}
+
+/* Soil measurement cards */
+
+#page-overview .metric-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 16px;
+}
+
+#page-overview .metric-card {
+    min-height: 135px;
+    padding: 20px;
+    border-radius: 15px;
+    transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+#page-overview .metric-card:hover {
+    transform: translateY(-3px);
+}
+
+#page-overview .metric-label {
+    font-size: 14px;
+    font-weight: 650;
+}
+
+#page-overview .metric-value {
+    font-size: 27px;
+    font-weight: 750;
+    margin-top: 15px;
+}
+
+#page-overview .metric-description {
+    font-size: 13px;
+    line-height: 1.5;
+    margin-top: 7px;
+}
+
+/* Model comparison */
+
+#page-overview .model-grid {
+    gap: 16px;
+}
+
+#page-overview .model-card {
+    border-radius: 15px;
+    padding: 21px;
+}
+
+/* Responsive layout */
+
+@media (max-width: 900px) {
+    #page-overview .metric-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 600px) {
+    #page-overview .hero-grid,
+    #page-overview .metric-grid,
+    #page-overview .model-grid {
+        grid-template-columns: 1fr;
+    }
+
+    #page-overview .prediction-panel,
+    #page-overview .weather-panel {
+        padding: 20px;
+    }
+
+    #page-overview .metric-card {
+        min-height: 115px;
+    }
+
+    #page-overview .input-mode-row {
+        align-items: flex-start;
+        gap: 14px;
+        flex-direction: column;
+    }
+}
+
